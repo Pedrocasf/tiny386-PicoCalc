@@ -94,6 +94,15 @@ With ESP-IDF 5.2.x:
 
 With ESP-IDF 6.0.x (experimental):
 - JC4880P443 (ESP32-P4 Rev1.3 360MHz, 800x480)
+- ClockworkPi PicoCalc with an ESP32-P4 in the Raspberry Pi Pico footprint
+  (320x320) -- **work in progress**: display, keyboard and microSD work, there
+  is no mouse or sound yet. Text mode is drawn 1:1 with a built-in 4x10 font,
+  so use `vga_force_8dm = 1`. Files come from the microSD card in the ESP32-P4
+  board's own slot (`esp/tiny386_picocalc.ini`), or, with no card inserted,
+  from the `storage` flash partition, which `idf.py flash` fills from
+  `esp/flash_data/` plus `bios.bin`/`vgabios.bin` in the repository root.
+  Check the GPIO numbers in `esp/main/board_picocalc.h` against the ESP32-P4
+  board or adapter you plug into the Pico socket.
 
 ### Build and Flash
 You can find the pre-built flash image `esp/flash_image_JC3248W535.bin` from [here](https://github.com/hchunhui/tiny386/releases).
