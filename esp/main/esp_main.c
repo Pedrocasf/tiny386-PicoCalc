@@ -20,6 +20,19 @@
 #include "../../pc.h"
 #include "common.h"
 
+/* Boards whose panel task blocks on transfer completion want to sit above the
+ * idle task; the default keeps the historical priority. */
+#ifndef VGA_TASK_PRIO
+#define VGA_TASK_PRIO 0
+#endif
+
+/* Pacing between the slices of one frame in redraw(): it spreads vga_step()
+ * calls across the blit so a guest polling for retrace sees it advance.  Set
+ * to 0 to blit as fast as the panel takes it. */
+#ifndef REDRAW_SLICE_DELAY_US
+#define REDRAW_SLICE_DELAY_US 900
+#endif
+
 //
 #include "esp_private/system_internal.h"
 uint32_t get_uticks()
@@ -123,7 +136,9 @@ static void redraw(void *opaque,
 			 LCD_HEIGHT, LCD_WIDTH / NN * (i + 1),
 			 s->fb1);
 		vga_step(s->pc->vga);
-		usleep(900);
+#if REDRAW_SLICE_DELAY_US
+		usleep(REDRAW_SLICE_DELAY_US);
+#endif
 	}
 }
 
@@ -174,6 +189,7 @@ void i2s_main();
 void wifi_main(const char *, const char *);
 void storage_init(void);
 void usb_setup(void);
+void kbd_picocalc_main(void);
 
 struct esp_ini_config {
 	const char *filename;
@@ -268,6 +284,9 @@ void app_main(void)
 
 	i2s_main();
 	storage_init();
+#ifdef KBD_I2C_SDA
+	kbd_picocalc_main();
+#endif
 
 	esp_psram_init();
 #ifndef PSRAM_ALLOC_LEN
@@ -276,8 +295,16 @@ void app_main(void)
 	psram = esp_psram_get(&len);
 	psram_len = len;
 #else
+	/* The pool has to be one contiguous block, so the largest free block is
+	 * the real ceiling on PSRAM_ALLOC_LEN (and therefore on mem_size). */
+	fprintf(stderr, "psram: %u free, largest block %u\n",
+		(unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+		(unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 	psram_len = PSRAM_ALLOC_LEN;
 	psram = heap_caps_calloc(1, psram_len, MALLOC_CAP_SPIRAM);
+	if (!psram)
+		fprintf(stderr, "cannot reserve %ld bytes of PSRAM: lower "
+				"PSRAM_ALLOC_LEN\n", psram_len);
 #endif
 
 	const static char *files[] = {
@@ -292,6 +319,17 @@ void app_main(void)
 			break;
 		}
 	}
+	if (!config.filename) {
+		/* Without this the config path reaches fopen() as NULL and the
+		 * emulator task dies in a reboot loop.  Note that a mounted SD
+		 * card means /spiflash is not mounted at all, so a card with no
+		 * tiny386.ini on it lands here. */
+		fprintf(stderr, "no tiny386.ini found:");
+		for (int i = 0; files[i]; i++)
+			fprintf(stderr, " %s", files[i]);
+		fprintf(stderr, "\n");
+		return;
+	}
 
 	if (config.enable_usb) {
 		vTaskDelay(2000 / portTICK_PERIOD_MS);
@@ -304,6 +342,6 @@ void app_main(void)
 
 	if (psram) {
 		xTaskCreatePinnedToCore(i386_task, "i386_main", 4096, &config, 3, NULL, 1);
-		xTaskCreatePinnedToCore(vga_task, "vga_task", 4096, NULL, 0, NULL, 0);
+		xTaskCreatePinnedToCore(vga_task, "vga_task", 4096, NULL, VGA_TASK_PRIO, NULL, 0);
 	}
 }

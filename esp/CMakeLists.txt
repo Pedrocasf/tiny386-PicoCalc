@@ -22,3 +22,27 @@ set(SDKCONFIG_DEFAULTS "${BOARD_SDKCONFIG}")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(tiny386)
+
+# Boards with no SD card read their config from the "storage" FAT partition.
+# Stage it in the build directory from esp/flash_data/ plus bios.bin/vgabios.bin
+# out of the repository root, then write it as part of `idf.py flash`.
+# The staging copy happens at configure time, so re-run cmake (or touch this
+# file) after rebuilding the ROMs.  Drop FLASH_IN_PROJECT once the partition
+# holds data you do not want every flash to overwrite.
+if(BOARD STREQUAL "picocalc" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/flash_data")
+    set(STORAGE_STAGE_DIR "${CMAKE_BINARY_DIR}/storage_data")
+    file(MAKE_DIRECTORY "${STORAGE_STAGE_DIR}")
+    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/flash_data/"
+         DESTINATION "${STORAGE_STAGE_DIR}")
+    foreach(rom bios.bin vgabios.bin)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../${rom}")
+            file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/../${rom}"
+                 DESTINATION "${STORAGE_STAGE_DIR}")
+        else()
+            message(WARNING "${rom} not found in the repository root: the "
+                            "storage partition will have no ${rom} and "
+                            "load_rom() will abort at run time")
+        endif()
+    endforeach()
+    fatfs_create_spiflash_image(storage "${STORAGE_STAGE_DIR}" FLASH_IN_PROJECT)
+endif()

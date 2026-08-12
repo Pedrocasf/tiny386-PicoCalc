@@ -709,12 +709,119 @@ static void vbe_update_vgaregs(VGAState *s)
     s->cr[VGA_CRTC_MAX_SCAN] &= ~0x9f; /* no double scan */
 }
 
+#ifdef SMALL_TEXT_FONT
+#if BPP != 16
+#error "SMALL_TEXT_FONT requires BPP == 16"
+#endif
+#include "font_small.h"
+
+static inline uint16_t small_pix(uint32_t c)
+{
+#ifdef SWAP_BYTEORDER_BPP16
+    return (uint16_t) ((c << 8) | ((c >> 8) & 0xff));
+#else
+    return (uint16_t) c;
+#endif
+}
+
+/* Draw text mode 1:1 with the built-in 4x10 font instead of downscaling an
+   8x16 one, which turns to mush on a small panel.  Returns 0 when the mode is
+   too big for the framebuffer, and the caller falls back to the generic
+   (scaling) renderer below. */
+static int vga_draw_text_small(VGAState *s,
+                               SimpleFBDrawFunc *redraw_func, void *opaque)
+{
+    FBDevice *fb_dev = s->fb_dev;
+    static int last_x1 = -1, last_y1 = -1;
+
+    int cheight = (s->cr[9] & 0x1f) + 1;
+    int width = s->cr[0x01] + 1;
+    int height = s->cr[0x12] |
+        ((s->cr[0x07] & 0x02) << 7) |
+        ((s->cr[0x07] & 0x40) << 3);
+    height = (height + 1) / cheight;
+    if (width <= 0 || height <= 0 ||
+        width * FONT_SMALL_CW > fb_dev->width ||
+        height * FONT_SMALL_CH > fb_dev->height)
+        return 0;
+
+    uint32_t now = get_uticks();
+    if (after_eq(now, s->cursor_blink_time)) {
+        s->cursor_blink_time = now + 133333;
+        s->cursor_visible_phase = !s->cursor_visible_phase;
+    }
+    update_palette16(s, s->last_palette);
+
+    int x1 = (fb_dev->width - width * FONT_SMALL_CW) / 2;
+    int y1 = (fb_dev->height - height * FONT_SMALL_CH) / 2;
+    if (x1 != last_x1 || y1 != last_y1) {
+        /* geometry changed: clear the margins around the text area once */
+        memset(fb_dev->fb_data, 0, fb_dev->height * fb_dev->stride);
+        last_x1 = x1;
+        last_y1 = y1;
+    }
+
+    uint32_t line_offset = s->cr[0x13] << 3;
+    uint32_t start_addr = s->cr[0x0d] | (s->cr[0x0c] << 8);
+    uint32_t ch_addr1 = start_addr * 4;
+    uint32_t cursor_addr = ((s->cr[0x0e] << 8) | s->cr[0x0f]) * 4;
+    int cursor_start = s->cr[0x0a];
+    int cursor_end = s->cr[0x0b];
+    uint8_t *vga_ram = s->vga_ram;
+
+    for (int cy = 0; cy < height; cy++) {
+        uint32_t ch_addr = ch_addr1;
+        for (int cx = 0; cx < width; cx++) {
+            uint32_t ch_attr = *(uint16_t *)(vga_ram + (ch_addr & 0x1fffe));
+            uint32_t cattr = ch_attr >> 8;
+            const uint8_t *glyph = font_small[ch_attr & 0xff];
+            uint16_t fg = small_pix(s->last_palette[cattr & 0x0f]);
+            uint16_t bg = small_pix(s->last_palette[(cattr >> 4) & 0x0f]);
+            uint8_t *dst = fb_dev->fb_data +
+                (y1 + cy * FONT_SMALL_CH) * fb_dev->stride +
+                (x1 + cx * FONT_SMALL_CW) * (BPP / 8);
+
+            for (int row = 0; row < FONT_SMALL_CH; row++) {
+                uint32_t bits = glyph[row];
+                uint16_t *p = (uint16_t *) (dst + row * fb_dev->stride);
+                p[0] = (bits & 8) ? fg : bg;
+                p[1] = (bits & 4) ? fg : bg;
+                p[2] = (bits & 2) ? fg : bg;
+                p[3] = (bits & 1) ? fg : bg;
+            }
+
+            if (ch_addr == cursor_addr && !(cursor_start & 0x20) &&
+                s->cursor_visible_phase) {
+                /* scale the cursor's scanline range into the smaller cell */
+                int r0 = (cursor_start & 0x1f) * FONT_SMALL_CH / cheight;
+                int r1 = (cursor_end & 0x1f) * FONT_SMALL_CH / cheight;
+                if (r1 > FONT_SMALL_CH - 1)
+                    r1 = FONT_SMALL_CH - 1;
+                for (int row = r0; row <= r1; row++) {
+                    uint16_t *p = (uint16_t *) (dst + row * fb_dev->stride);
+                    p[0] = p[1] = p[2] = fg;
+                }
+            }
+            ch_addr += 4;
+        }
+        ch_addr1 += line_offset;
+    }
+
+    redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
+    return 1;
+}
+#endif
+
 /* the text refresh is just for debugging and initial boot message, so
    it is very incomplete */
 static void vga_text_refresh(VGAState *s,
                              SimpleFBDrawFunc *redraw_func, void *opaque,
                              int full_update)
 {
+#ifdef SMALL_TEXT_FONT
+    if (vga_draw_text_small(s, redraw_func, opaque))
+        return;
+#endif
     FBDevice *fb_dev = s->fb_dev;
     int width, height, cwidth, cheight, cy, cx, x1, y1, width1, height1;
     int cx_min, cx_max, dup9;

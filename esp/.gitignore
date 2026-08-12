@@ -2,3 +2,5 @@ build
 managed_components
 sdkconfig
 .vscode/settings.json
+flash_data/*.bin
+flash_data/*.img

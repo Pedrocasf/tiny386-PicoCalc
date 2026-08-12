@@ -107,6 +107,17 @@ build_esp_p4() {
 	cd ..
 }
 
+build_esp_picocalc() {
+    mkdir -p out/esp &&
+	cd esp && rm -rf build sdkconfig && idf.py -DBOARD=picocalc update-dependencies build &&
+	cd build &&
+	esptool.py --chip esp32p4 merge_bin -o flash_image_PicoCalc.bin '@flash_args' &&
+	cd .. &&
+	cp build/flash_image*.bin ../out/esp &&
+	cp flash_data/tiny386.ini ../out/esp/tiny386_picocalc.ini &&
+	cd ..
+}
+
 bundle() {
     cp README.md LICENSE out
     tar cJf tiny386.tar.xz out --transform 's/^out/tiny386/'
@@ -122,6 +133,8 @@ elif [ "$1" == "patch_idf_60" ]; then
     patch_idf_60
 elif [ "$1" == "esp" ]; then
     build_esp
+elif [ "$1" == "esp_picocalc" ]; then
+    build_esp_picocalc
 elif [ "$1" == "esp_p4" ]; then
     build_esp_p4
 elif [ "$1" == "bundle" ]; then

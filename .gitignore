@@ -2,3 +2,5 @@
 *.o
 .depends
 fmopl.inc
+/bios.bin
+/vgabios.bin
