@@ -38,3 +38,7 @@ dependencies:
     rules:
     - if: "target in [esp32p4]"
   usb_host_hid: "^1.0.1"
+  # esp/main/usb_msc.c (USB mass-storage device mode) additionally needs
+  #   espressif/esp_tinyusb: {version: "^2.2.1", rules: [{if: "target in [esp32p4]"}]}
+  # It is left out because no board here enables USE_USB_MSC, and the component
+  # is linked in whole even when nothing references it -- about 60 KB.

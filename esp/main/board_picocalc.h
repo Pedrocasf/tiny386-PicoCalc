@@ -32,11 +32,18 @@
 //#define IRAM_ATTR_CPU_EXEC1 IRAM_ATTR
 #define IRAM_ATTR_CPU_EXEC1
 
-/* Bump-allocator pool carved out of PSRAM, feeding exactly three things: guest
+/*
+ * Bump-allocator pool carved out of PSRAM, feeding exactly three things: guest
  * RAM (mem_size), VGA memory (vga_mem_size) and the 320x320x2 framebuffer.
- * The board reports 32 MB of PSRAM, so 20 MB here leaves mem_size = 16M about
- * 3.5 MB of slack and still keeps 12 MB for the general heap. */
-#define PSRAM_ALLOC_LEN (20 * 1024 * 1024)
+ * 31 MB covers mem_size = 30M plus 512K of VGA memory and a 204K framebuffer,
+ * with a little slack.
+ *
+ * The measured ceiling is the largest contiguous SPIRAM block, 33030144 bytes
+ * on this board -- app_main prints it at boot.  Reserving this much leaves
+ * barely 1 MB of PSRAM for anything else, which is fine while WiFi is unused
+ * but is the first thing to lower if some later allocation starts failing.
+ */
+#define PSRAM_ALLOC_LEN (31 * 1024 * 1024)
 
 #define BPP 16
 #define FULL_UPDATE
@@ -108,12 +115,43 @@
 #define SD_PWR_CTRL_LDO_IO_ID 4
 #define USE_HOSTED_WIFI
 
+/*
+ * The PicoCalc has its own SD slot on the Pico header (SPI: SCK 46, MOSI 33,
+ * MISO 48, CS 47, card detect 26 on this board) and it can be mounted next to
+ * the SDMMC one, since they are different peripherals.  Left out for now.
+ */
+
 /* Keyboard/backlight/battery MCU (esp/main/kbd_picocalc.c). */
 #define KBD_I2C_SDA 50
 #define KBD_I2C_SCL 49
 #define KBD_I2C_ADDR 0x1f
 /* Logs every raw key event on the console; drop once the mapping is trusted. */
 #define KBD_DEBUG
+
+/*
+ * Hold F1 (key code 0x81) while powering on to export the microSD card to a
+ * host PC as a USB drive instead of booting the emulator
+ * (esp/main/usb_msc.c).  Needs CONFIG_TINYUSB_MSC_ENABLED in the sdkconfig,
+ * and cannot coexist with the USB HID host (`enable_usb` in the ini), since
+ * that is host mode on the same port.
+ */
+/*
+ * USB disk mode: hold USB_MSC_KEY at power-on and the SD card is exported to a
+ * host PC instead of the emulator starting.  Disabled here because this board
+ * cannot use it: the Waveshare ESP32-P4-WIFI6 has a single USB socket and it
+ * goes to a CH343 UART bridge, so the P4's own USB pins reach no host -- the
+ * stack installs happily and then waits forever with no `host attached`.
+ * Enabling it costs ~90 KB of flash for TinyUSB plus an 800 ms boot probe.
+ * Re-enable on a board whose USB-C reaches the SoC; the code is unchanged, but
+ * the espressif/esp_tinyusb dependency has to go back into idf_component.yml.
+ */
+//#define USE_USB_MSC
+#define USB_MSC_KEY 0x81
+/* Which USB socket the board wires to the P4: the default is the high-speed
+ * OTG pins; define USB_MSC_FULL_SPEED for the full-speed (USB-Serial-JTAG)
+ * pins instead.  Neither produced a `host attached` event on the board tested,
+ * which pointed at the cabling rather than the port choice. */
+//#define USB_MSC_FULL_SPEED
 
 /*
  * Sound: 1-bit PDM per channel into the PicoCalc's RC filter and amplifier

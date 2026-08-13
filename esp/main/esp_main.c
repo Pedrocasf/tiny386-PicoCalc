@@ -190,6 +190,8 @@ void wifi_main(const char *, const char *);
 void storage_init(void);
 void usb_setup(void);
 void kbd_picocalc_main(void);
+int kbd_picocalc_boot_key(void);
+void usb_msc_main(void);
 
 struct esp_ini_config {
 	const char *filename;
@@ -288,6 +290,17 @@ void app_main(void)
 	kbd_picocalc_main();
 #endif
 
+#ifdef USE_USB_MSC
+	/* Boot mode: export the SD card to a host PC and do not run the
+	 * emulator, which would otherwise have its disk written underneath it.
+	 * Checked before the config is read, so it also works when the card
+	 * carries no filesystem at all (hda = /dev/mmcblk0). */
+	if (kbd_picocalc_boot_key()) {
+		usb_msc_main();
+		return;
+	}
+#endif
+
 	esp_psram_init();
 #ifndef PSRAM_ALLOC_LEN
 	// use the whole psram
@@ -316,6 +329,7 @@ void app_main(void)
 	for (int i = 0; files[i]; i++) {
 		if (ini_parse(files[i], parse_ini, &config) == 0) {
 			config.filename = files[i];
+			fprintf(stderr, "config: %s\n", config.filename);
 			break;
 		}
 	}
