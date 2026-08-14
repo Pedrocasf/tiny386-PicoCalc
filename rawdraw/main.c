@@ -87,7 +87,14 @@ Console *console_init(int width, int height)
 #endif
 	s->fb = bigmalloc(s->width * s->height * 4);
 	s->cnfgret = 1;
-	CNFGSetup("tiny386 - use ctrl + ] to grab/ungrab", s->width, s->height);
+	if (CNFGSetup("tiny386 - use ctrl + ] to grab/ungrab",
+		      s->width, s->height) < 0) {
+		fprintf(stderr, "cannot open a %dx%d window\n",
+			s->width, s->height);
+		fprintf(stderr, "(no display? use tiny386_headless for a "
+				"machine with no screen)\n");
+		exit(1);
+	}
 	osd_attach_console(s->osd, s);
 	s->lastx = -1;
 	s->lasty = -1;

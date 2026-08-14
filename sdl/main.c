@@ -75,8 +75,18 @@ Console *console_init(int width, int height)
 	s->width = width;
 	s->height = height;
 #endif
-	SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
+		fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+		fprintf(stderr, "(no display? use tiny386_headless for a "
+				"machine with no screen)\n");
+		exit(1);
+	}
 	s->screen = SDL_SetVideoMode(s->width, s->height, BPP, 0);
+	if (!s->screen) {
+		fprintf(stderr, "cannot open a %dx%d %d bpp window: %s\n",
+			s->width, s->height, BPP, SDL_GetError());
+		exit(1);
+	}
 	SDL_EnableKeyRepeat(SDL_DEFAULT_REPEAT_DELAY,
 			    SDL_DEFAULT_REPEAT_INTERVAL);
 	SDL_WM_SetCaption("tiny386 - use ctrl + ] to grab/ungrab", NULL);

@@ -4,7 +4,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include "i386.h"
 #include "pc.h"
+
+/* pc_step() calls between checks for an idle guest, and the instruction rate
+ * below which it counts as idle -- a working guest runs orders of magnitude
+ * faster than a halt/timer-interrupt loop. */
+#define IDLE_CHECK_INTERVAL 1000
+#define IDLE_RATE 200000
 
 // platform HAL implementation
 #include <time.h>
@@ -92,9 +99,55 @@ int main(int argc, char *argv[])
 	load_bios_and_reset(pc);
 
 	pc->boot_start_time = get_uticks();
+
+	/*
+	 * A guest that halts waiting for a keypress looks exactly like a hang
+	 * from out here: no more output, and the process sleeping in the
+	 * usleep() the halt handler does.  Say so, since this build has neither
+	 * a screen for it to draw on nor a keyboard to satisfy it.  Progress is
+	 * measured with the emulated cpu's own cycle counter.
+	 */
+#ifndef USE_CPUABS
+	long last_cycle = 0;
+	uint32_t last_sample = get_uticks();
+	bool idle_reported = false;
+	int countdown = IDLE_CHECK_INTERVAL;
+#endif
+
 	for (; pc->shutdown_state != 8;) {
 		pc_step(pc);
 		pc_vga_step(pc);
+
+#ifndef USE_CPUABS
+		if (--countdown > 0)
+			continue;
+		countdown = IDLE_CHECK_INTERVAL;
+
+		uint32_t now = get_uticks();
+		if (now - last_sample < 2000000)
+			continue;
+
+		long cycle = cpui386_get_cycle(pc->cpu);
+		long rate = (cycle - last_cycle) / 2;
+		last_cycle = cycle;
+		last_sample = now;
+
+		/* A guest waiting on a keypress is not stopped: it halts, wakes
+		 * on the timer interrupt, and halts again, so what collapses is
+		 * the rate rather than progress itself. */
+		if (rate < IDLE_RATE && !idle_reported) {
+			fprintf(stderr, "guest is idle (%ld instructions/s): "
+					"it is halting, most likely waiting for "
+					"input this build cannot give it -- no "
+					"screen, no keyboard (not a hang)\n",
+				rate);
+			idle_reported = true;
+		} else if (rate >= IDLE_RATE && idle_reported) {
+			fprintf(stderr, "guest is running again (%ld "
+					"instructions/s)\n", rate);
+			idle_reported = false;
+		}
+#endif
 	}
 	return 0;
 }
