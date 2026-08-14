@@ -809,7 +809,11 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 			continue;
 		int ret;
 		ret = emulink_attach_floppy(pc->emulink, i, fdd[i]);
-		assert(ret == 0);
+		if (ret != 0)
+			/* emulink_attach_floppy() has said why.  Exiting here
+			 * matches how an unusable hda is treated, and beats
+			 * asserting on what is only a bad config line. */
+			exit(1);
 	}
 
 	cb->iomem = pc;
