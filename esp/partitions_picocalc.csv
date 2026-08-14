@@ -1,0 +1,17 @@
+# ESP-IDF Partition Table -- PicoCalc / ESP32-P4 (32 MB flash)
+#
+# Same as partitions.csv up to the ROMs, then: no vmlinux.bin (that 4 MB is
+# only for booting a Linux kernel directly, which this board does not do), and
+# "storage" grows to fill a 32 MB chip instead of stopping at 16 MB.
+# Keeping bios.bin/vgabios.bin at their original offsets matters: the ini names
+# them without a leading '/' so load_rom() reads the partitions directly, and
+# esp/CMakeLists.txt writes them there from the repository root.
+#
+# Name, Type, SubType, Offset, Size, Flags
+nvs,data,nvs,0x9000,24K,
+phy_init,data,phy,0xf000,4K,
+factory,app,factory,0x10000,1792K,
+bios.bin,data,undefined,0x1d0000,128K,
+vgabios.bin,data,undefined,0x1f0000,60K,
+linuxstart.bin,data,undefined,0x1ff000,4K,
+storage,data,fat,0x200000,30M,

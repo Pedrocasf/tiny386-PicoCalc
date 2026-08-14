@@ -22,14 +22,30 @@
  */
 #define BUILD_ESP32
 
+/*
+ * Runs the interpreter benchmark instead of booting a guest: a fixed
+ * instruction loop planted at the reset vector, reported as host cycles per
+ * guest instruction, with the panel left idle so the memory system is quiet.
+ * See cpu_bench() in esp_main.c.  Off by default -- it overwrites the reset
+ * vector, so no guest can boot while it is on.
+ */
+//#define CPU_BENCH
+
 /* Installs the UART0 driver.  Required whenever the ini sets enable_serial=1:
  * misc.c polls uart_get_buffered_data_len() for emulated COM1 input, which
  * spams "uart driver error" until the driver exists.  With it, typing into the
  * ESP console goes to the guest's COM1 -- the only input path until stage 3. */
 #define ESPDEBUG
 
-// XXX: ld reports "error: Total discarded sections size is X bytes"
-//#define IRAM_ATTR_CPU_EXEC1 IRAM_ATTR
+/*
+ * Putting cpu_exec1() -- the interpreter's dispatch loop -- in internal RAM
+ * would avoid running it from flash through the cache, but it does not fit:
+ * the whole instruction set is inlined into that one function, 140180 bytes
+ * of it, and the P4 has 768 KB of SRAM in total.  The linker gives up with
+ * "Total discarded sections size is 89222 bytes" (63938 with L2 halved to
+ * 256 KB, which frees SRAM at the cost of cache).  It would need the hot path
+ * split out of the cold instruction bodies first.
+ */
 #define IRAM_ATTR_CPU_EXEC1
 
 /*
@@ -116,9 +132,26 @@
 #define USE_HOSTED_WIFI
 
 /*
+ * Keep /spiflash mounted even with a card present, so tiny386.ini can live in
+ * the flash storage partition (esp/flash_data/, written by `idf.py flash`)
+ * while the card carries only disk images.  The ROMs do not need this -- they
+ * are read straight out of their own partitions, see the ini.
+ *
+ * An earlier attempt at this failed with ESP_ERR_NO_MEM, but that was with
+ * three volumes mounted (both cards plus this); with one card it fits.  The
+ * mount result is logged, so check the console if a config goes missing.
+ *
+ * Note esp_main.c still looks at the card first, so remove tiny386.ini from it
+ * for the flash copy to take effect; the console prints which one was used.
+ */
+#define MOUNT_SPIFLASH_ALWAYS
+
+/*
  * The PicoCalc has its own SD slot on the Pico header (SPI: SCK 46, MOSI 33,
  * MISO 48, CS 47, card detect 26 on this board) and it can be mounted next to
- * the SDMMC one, since they are different peripherals.  Left out for now.
+ * the SDMMC one, since they are different peripherals.  Left out for now --
+ * note that a third volume is what pushed the /spiflash mount above out of
+ * memory.
  */
 
 /* Keyboard/backlight/battery MCU (esp/main/kbd_picocalc.c). */

@@ -154,7 +154,7 @@ static int read_event(uint8_t ev[2])
 	return ev[0] != 0 && ev[1] != 0;
 }
 
-#ifdef USB_MSC_KEY
+#ifdef USE_USB_MSC
 #ifndef USB_MSC_KEY_PROBE_MS
 /* Long enough for the MCU's auto-repeat to produce a second event while the
  * key is held, at the cost of delaying every normal boot by this much. */

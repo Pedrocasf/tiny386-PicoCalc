@@ -10,15 +10,23 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_psram.h"
+#include "esp_timer.h"
 #include "esp_partition.h"
 #include "driver/uart.h"
 #include "esp_vfs.h"
 #include "esp_vfs_fat.h"
 #include "esp_system.h"
 
+#include "../../i386.h"
 #include "../../ini.h"
 #include "../../pc.h"
 #include "common.h"
+
+/* pc_step() calls between checks of the guest-speed timer. */
+#define STEP_REPORT_INTERVAL 20000
+
+/* for converting the benchmark's guest Mips into host cycles per instruction */
+#define CPU_CLOCK_MHZ (CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ)
 
 /* Boards whose panel task blocks on transfer completion want to sit above the
  * idle task; the default keeps the historical priority. */
@@ -142,6 +150,79 @@ static void redraw(void *opaque,
 	}
 }
 
+#ifdef CPU_BENCH
+/*
+ * Is the interpreter slow, or is it waiting for PSRAM?
+ *
+ * Runs a seven-byte real-mode loop with no data operands, planted at the reset
+ * vector, so after the first pass the whole working set -- code, and the cpu
+ * state itself -- sits in cache.  Compare the rate printed here with the
+ * "guest:" rate of a real workload: if this one is much higher, the cost is
+ * guest memory latency and a recompiler would not help much; if they are
+ * similar, the cost really is decode and dispatch.
+ *
+ * Never returns, and the guest cannot boot afterwards -- the reset vector is
+ * gone.  Remove CPU_BENCH from the board header to get a normal machine back.
+ */
+#define BENCH_BODY 0xf0000	/* f000:0000, reached from the reset vector */
+#define BENCH_REPS 16		/* copies of the instruction under test */
+
+struct bench {
+	const char *name;
+	int len;
+	const uint8_t code[4];
+};
+
+/* Each runs as BENCH_REPS copies followed by a jump back, so the instruction
+ * under test dominates.  Differences between them localise the cost: nop is
+ * fetch and dispatch alone, mov adds operand decode, add adds the lazy-flag
+ * bookkeeping, and the memory forms add the segment/TLB path. */
+static const struct bench benches[] = {
+	{ "nop",           1, {0x90} },
+	{ "mov ax,bx",     2, {0x89, 0xd8} },
+	{ "add ax,bx",     2, {0x01, 0xd8} },
+	{ "add [bx],ax",   2, {0x01, 0x07} },
+	{ "mov al,[bx]",   2, {0x8a, 0x07} },
+	/* direct address: no ModRM, so it skips modsib() entirely */
+	{ "mov al,[1234]", 3, {0xa0, 0x34, 0x12} },
+};
+
+static void bench_one(PC *pc, const struct bench *b)
+{
+	uint8_t *body = (uint8_t *) pc->phys_mem + BENCH_BODY;
+	int off = 0;
+
+	for (int i = 0; i < BENCH_REPS; i++, off += b->len)
+		memcpy(body + off, b->code, b->len);
+	body[off++] = 0xeb;			/* jmp back to the top */
+	body[off] = (uint8_t) -(off + 1);
+
+	cpui386_reset(pc->cpu);			/* back to f000:fff0 */
+
+	int64_t t0 = esp_timer_get_time();
+	long c0 = cpui386_get_cycle(pc->cpu);
+	while (esp_timer_get_time() - t0 < 1500000)
+		pc_step(pc);
+	int64_t dt = esp_timer_get_time() - t0;
+	long dc = cpui386_get_cycle(pc->cpu) - c0;
+
+	double mips = dc / (double) dt;
+	fprintf(stderr, "bench: %-12s %5.2f Mips  %3.0f cycles/insn\n",
+		b->name, mips, CPU_CLOCK_MHZ / mips);
+}
+
+static void cpu_bench(PC *pc)
+{
+	/* jmp from the reset vector down to f000:0000, where there is room */
+	static const uint8_t tramp[] = {0xe9, 0x0d, 0x00};
+	memcpy(pc->phys_mem + 0xffff0, tramp, sizeof(tramp));
+
+	for (;;)
+		for (int i = 0; i < (int) (sizeof(benches) / sizeof(benches[0])); i++)
+			bench_one(pc, &benches[i]);
+}
+#endif
+
 static int pc_main(const char *file)
 {
 	PCConfig conf;
@@ -174,9 +255,36 @@ static int pc_main(const char *file)
 
 	load_bios_and_reset(pc);
 
+#ifdef CPU_BENCH
+	cpu_bench(pc);	/* never returns */
+#endif
+
 	pc->boot_start_time = get_uticks();
+
+	/* Report guest speed every few seconds.  The counter is the emulated
+	 * cpu's own, so this is the number to watch when changing clocks,
+	 * optimisation levels or cpu_gen -- and the check is amortised over
+	 * many steps to keep it out of the hot loop. */
+	int64_t mark = esp_timer_get_time();
+	long cycles_mark = cpui386_get_cycle(pc->cpu);
+	int countdown = STEP_REPORT_INTERVAL;
+
 	for (; pc->shutdown_state != 8;) {
 		pc_step(pc);
+
+		if (--countdown > 0)
+			continue;
+		countdown = STEP_REPORT_INTERVAL;
+
+		int64_t now = esp_timer_get_time();
+		if (now - mark >= 5000000) {
+			long cycles = cpui386_get_cycle(pc->cpu);
+			fprintf(stderr, "guest: %.2f Mcycles/s\n",
+				(cycles - cycles_mark) /
+				(double) (now - mark));
+			mark = now;
+			cycles_mark = cycles;
+		}
 	}
 	return 0;
 }

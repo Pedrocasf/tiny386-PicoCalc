@@ -267,13 +267,28 @@ void storage_init(void)
 
 	// mount spiflash, only if sdcard is not mounted
 	// to save memory
+	//
+	// Boards keeping tiny386.ini in the flash storage partition need it
+	// mounted regardless, or a card carrying only disk images hides the
+	// config.  Each mounted volume costs internal RAM -- FatFs gives every
+	// open-file slot a buffer of CONFIG_WL_SECTOR_SIZE (4096) bytes -- so
+	// this can fail with ESP_ERR_NO_MEM; the result is logged either way.
+#ifdef MOUNT_SPIFLASH_ALWAYS
+	(void) sd_mount_ok;
+	{
+#else
 	if (!sd_mount_ok) {
+#endif
 		const esp_vfs_fat_mount_config_t spiflash_cfg = {
 			.max_files = 4,
 			.format_if_mount_failed = false,
 			.allocation_unit_size = CONFIG_WL_SECTOR_SIZE
 		};
-		esp_vfs_fat_spiflash_mount_rw_wl("/spiflash", "storage",
-						 &spiflash_cfg, &s_wl_handle);
+		esp_err_t r = esp_vfs_fat_spiflash_mount_rw_wl("/spiflash",
+							       "storage",
+							       &spiflash_cfg,
+							       &s_wl_handle);
+		ESP_LOGI(TAG, "/spiflash %s",
+			 r == ESP_OK ? "mounted" : esp_err_to_name(r));
 	}
 }

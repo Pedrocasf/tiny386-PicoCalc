@@ -705,18 +705,49 @@ static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword add
 	return true;
 }
 
+/*
+ * With paging off the linear address is already the physical one, so the whole
+ * translate()/segcheck()/translate_laddr() chain reduces to one addition --
+ * but only if it is inlined into the caller instead of being a call that fills
+ * in OptAddr and returns.  That is the common case for real-mode guests (all
+ * of DOS) and for protected mode before paging is enabled, so it is worth a
+ * fast path here; everything else falls back to the full version.
+ *
+ * The null-selector check is the only part of segcheck() that applies without
+ * paging, so it is kept.
+ */
+static inline bool translate_nopg(CPUI386 *cpu, OptAddr *res, int seg,
+				  uword addr)
+{
+	if (unlikely(cpu->cr0 & CR0_PG))
+		return false;
+	if (unlikely((cpu->cr0 & 1) && cpu->seg[seg].limit == 0 &&
+		     (cpu->seg[seg].sel & ~0x3) == 0))
+		return false;
+
+	res->res = ADDR_OK1;
+	res->addr1 = cpu->seg[seg].base + addr;
+	return true;
+}
+
 static inline bool translate8(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr)
 {
+	if (likely(translate_nopg(cpu, res, seg, addr)))
+		return true;
 	return translate(cpu, res, rwm, seg, addr, 1, cpu->cpl);
 }
 
 static inline bool translate16(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr)
 {
+	if (likely(translate_nopg(cpu, res, seg, addr)))
+		return true;
 	return translate(cpu, res, rwm, seg, addr, 2, cpu->cpl);
 }
 
 static inline bool translate32(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr)
 {
+	if (likely(translate_nopg(cpu, res, seg, addr)))
+		return true;
 	return translate(cpu, res, rwm, seg, addr, 4, cpu->cpl);
 }
 
@@ -724,6 +755,7 @@ static inline bool in_iomem(uword addr)
 {
 	return (addr >= 0xa0000 && addr < 0xc0000) || addr >= 0xe0000000;
 }
+
 
 static u8 IRAM_ATTR load8(CPUI386 *cpu, OptAddr *res)
 {
