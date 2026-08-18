@@ -57,6 +57,24 @@ struct CPUI386 {
 		uword flags;
 	} seg[8];
 
+	/*
+	 * Fast path for data accesses with paging off.  A segment check, an
+	 * iomem test and a bounds test stand between an operand and phys_mem,
+	 * and none of them depend on the offset -- only on the segment base
+	 * and on cr0.  So answer them once per segment load and keep the
+	 * result here: `host` is where offset 0 lands in phys_mem, and any
+	 * offset below `lim` is plain ram needing no further checks.  `lim`
+	 * already leaves room for a four byte access so one test serves every
+	 * operand size, and zero means "no fast path".  `filled` says the
+	 * refill has been tried, so a paging guest does not retry per access.
+	 */
+	struct segfast {
+		uword lim;
+		uword base;
+		u8 *host;
+		bool filled;
+	} segfast[8];
+
 	struct {
 		uword base;
 		uword limit;
@@ -208,95 +226,125 @@ static uword sext32(u32 a)
 	return (sword) (s32) a;
 }
 
-static inline u8 pload8(CPUI386 *cpu, uword addr)
+/*
+ * hload/hstore address host memory directly.  A translation that took the
+ * fast path already knows where in phys_mem the operand lives, so it hands
+ * the pointer over instead of the guest physical address and saves reloading
+ * cpu->phys_mem on every access.  pload/pstore are the same thing reached
+ * the long way round.
+ */
+static inline u8 hload8(const u8 *p)
 {
-	return cpu->phys_mem[addr];
+	return *p;
 }
 
-static inline void pstore8(CPUI386 *cpu, uword addr, u8 val)
+static inline void hstore8(u8 *p, u8 val)
 {
-	cpu->phys_mem[addr] = val;
+	*p = val;
 }
 
 #ifdef I386_OPT1
 /* only works on hosts that are little-endian and support unaligned access */
 #ifdef __mips__
-static inline u16 pload16(CPUI386 *cpu, uword addr)
+static inline u16 hload16(const u8 *p)
 {
-	const struct { u16 v; } __attribute__((packed))
-		*q = (void *) &(cpu->phys_mem[addr]);
+	const struct { u16 v; } __attribute__((packed)) *q = (const void *) p;
 	return q->v;
 }
 
-static inline u32 pload32(CPUI386 *cpu, uword addr)
+static inline u32 hload32(const u8 *p)
 {
-	const struct { u32 v; } __attribute__((packed))
-		*q = (void *) &(cpu->phys_mem[addr]);
+	const struct { u32 v; } __attribute__((packed)) *q = (const void *) p;
 	return q->v;
 }
 
-static inline void pstore16(CPUI386 *cpu, uword addr, u16 val)
+static inline void hstore16(u8 *p, u16 val)
 {
-	struct { u16 v; } __attribute__((packed))
-		*q = (void *) &(cpu->phys_mem[addr]);
+	struct { u16 v; } __attribute__((packed)) *q = (void *) p;
 	q->v = val;
 }
 
-static inline void pstore32(CPUI386 *cpu, uword addr, u32 val)
+static inline void hstore32(u8 *p, u32 val)
 {
-	struct { u32 v; } __attribute__((packed))
-		*q = (void *) &(cpu->phys_mem[addr]);
+	struct { u32 v; } __attribute__((packed)) *q = (void *) p;
 	q->v = val;
 }
 #else
+static inline u16 hload16(const u8 *p)
+{
+	return *(const u16 *) p;
+}
+
+static inline u32 hload32(const u8 *p)
+{
+	return *(const u32 *) p;
+}
+
+static inline void hstore16(u8 *p, u16 val)
+{
+	*(u16 *) p = val;
+}
+
+static inline void hstore32(u8 *p, u32 val)
+{
+	*(u32 *) p = val;
+}
+#endif
+#else
+static inline u16 hload16(const u8 *p)
+{
+	return p[0] | (p[1] << 8);
+}
+
+static inline u32 hload32(const u8 *p)
+{
+	return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+}
+
+static inline void hstore16(u8 *p, u16 val)
+{
+	p[0] = val;
+	p[1] = val >> 8;
+}
+
+static inline void hstore32(u8 *p, u32 val)
+{
+	p[0] = val;
+	p[1] = val >> 8;
+	p[2] = val >> 16;
+	p[3] = val >> 24;
+}
+#endif
+
+static inline u8 pload8(CPUI386 *cpu, uword addr)
+{
+	return hload8(cpu->phys_mem + addr);
+}
+
 static inline u16 pload16(CPUI386 *cpu, uword addr)
 {
-	return *(u16 *)&(cpu->phys_mem[addr]);
+	return hload16(cpu->phys_mem + addr);
 }
 
 static inline u32 pload32(CPUI386 *cpu, uword addr)
 {
-	return *(u32 *)&(cpu->phys_mem[addr]);
+	return hload32(cpu->phys_mem + addr);
+}
+
+static inline void pstore8(CPUI386 *cpu, uword addr, u8 val)
+{
+	hstore8(cpu->phys_mem + addr, val);
 }
 
 static inline void pstore16(CPUI386 *cpu, uword addr, u16 val)
 {
-	*(u16 *)&(cpu->phys_mem[addr]) = val;
+	hstore16(cpu->phys_mem + addr, val);
 }
 
 static inline void pstore32(CPUI386 *cpu, uword addr, u32 val)
 {
-	*(u32 *)&(cpu->phys_mem[addr]) = val;
+	hstore32(cpu->phys_mem + addr, val);
 }
-#endif
-#else
-static inline u16 pload16(CPUI386 *cpu, uword addr)
-{
-	u8 *mem = (u8 *) cpu->phys_mem;
-	return mem[addr] | (mem[addr + 1] << 8);
-}
-
-static inline u32 pload32(CPUI386 *cpu, uword addr)
-{
-	u8 *mem = (u8 *) cpu->phys_mem;
-	return mem[addr] | (mem[addr + 1] << 8) |
-		(mem[addr + 2] << 16) | (mem[addr + 3] << 24);
-}
-
-static inline void pstore16(CPUI386 *cpu, uword addr, u16 val)
-{
-	cpu->phys_mem[addr] = val;
-	cpu->phys_mem[addr + 1] = val >> 8;
-}
-
-static inline void pstore32(CPUI386 *cpu, uword addr, u32 val)
-{
-	cpu->phys_mem[addr] = val;
-	cpu->phys_mem[addr + 1] = val >> 8;
-	cpu->phys_mem[addr + 2] = val >> 16;
-	cpu->phys_mem[addr + 3] = val >> 24;
-}
-#endif
 
 /* lazy flags */
 enum {
@@ -522,10 +570,28 @@ typedef struct {
 	} res;
 	uword addr1;
 	uword addr2;
+	/* where addr1 lives in phys_mem, or NULL if the access needs the slow
+	 * path in load/store (iomem, out of range, or split across pages) */
+	u8 *host;
 } OptAddr;
+
+static void segfast_invalidate1(CPUI386 *cpu, int seg)
+{
+	cpu->segfast[seg].lim = 0;
+	cpu->segfast[seg].filled = false;
+}
+
+static void segfast_invalidate(CPUI386 *cpu)
+{
+	for (int i = 0; i < 8; i++)
+		segfast_invalidate1(cpu, i);
+}
 
 static void tlb_clear(CPUI386 *cpu)
 {
+	/* every reason to drop the tlb -- a cr3 write, a paging or protection
+	 * change, a reset -- is also a reason to drop the segment fast path */
+	segfast_invalidate(cpu);
 	for (int i = 0; i < tlb_size; i++) {
 		cpu->tlb.tab[i].lpgno = -1;
 	}
@@ -613,6 +679,7 @@ static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword 
 
 static bool IRAM_ATTR translate_laddr(CPUI386 *cpu, OptAddr *res, int rwm, uword laddr, int size, int cpl)
 {
+	res->host = NULL;	/* the slow path: load/store must check for real */
 	if (cpu->cr0 & CR0_PG) {
 		uword lpgno = laddr >> 12;
 		uword paddr;
@@ -669,6 +736,7 @@ static bool IRAM_ATTR translate(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uw
 static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword addr)
 {
 	assert(seg != -1);
+	res->host = NULL;
 	uword laddr = cpu->seg[seg].base + addr;
 
 	TRYL(segcheck(cpu, 1, seg, addr, 1));
@@ -716,49 +784,108 @@ static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword add
  * The null-selector check is the only part of segcheck() that applies without
  * paging, so it is kept.
  */
-static inline bool translate_nopg(CPUI386 *cpu, OptAddr *res, int seg,
-				  uword addr)
+static inline bool in_iomem(uword addr)
 {
-	if (unlikely(cpu->cr0 & CR0_PG))
+	return (addr >= 0xa0000 && addr < 0xc0000) || addr >= 0xe0000000;
+}
+
+/*
+ * Work out the fast path for one segment, or decide it has none.  Called at
+ * most once per segment load, and once more per segment while paging is on
+ * (`filled` stops it repeating).  See `struct segfast`.
+ */
+static bool segfast_refill(CPUI386 *cpu, int seg)
+{
+	struct segfast *sf = &cpu->segfast[seg];
+	sf->filled = true;
+	sf->lim = 0;
+
+	if (cpu->cr0 & CR0_PG)
 		return false;
-	if (unlikely((cpu->cr0 & 1) && cpu->seg[seg].limit == 0 &&
-		     (cpu->seg[seg].sel & ~0x3) == 0))
+	/* a null selector has to fault, so it gets no fast path */
+	if ((cpu->cr0 & 1) && cpu->seg[seg].limit == 0 &&
+	    (cpu->seg[seg].sel & ~0x3) == 0)
 		return false;
 
-	res->res = ADDR_OK1;
-	res->addr1 = cpu->seg[seg].base + addr;
+	/* how far plain ram runs from the base: up to the vga window, or from
+	 * the end of the rom hole to the end of memory */
+	uword base = cpu->seg[seg].base;
+	uword end;
+	if (base < 0xa0000)
+		end = 0xa0000;
+	else if (base < 0xc0000)
+		return false;		/* the vga window is iomem */
+	else if (base < 0xe0000000)
+		end = 0xe0000000;
+	else
+		return false;		/* and so is everything above it */
+
+	uword mem_end = (uword) cpu->phys_mem_size;
+	if (end > mem_end)
+		end = mem_end;
+	end &= ~(uword) 0xfff;	/* end on a page boundary: see optaddr_step */
+	if (base + 4 > end)
+		return false;
+
+	sf->base = base;
+	sf->host = cpu->phys_mem + base;
+	sf->lim = end - base - 3;	/* room for a four byte access */
 	return true;
+}
+
+static inline bool translate_fast(CPUI386 *cpu, OptAddr *res, int seg,
+				  uword addr)
+{
+	struct segfast *sf = &cpu->segfast[seg];
+	if (unlikely(addr >= sf->lim)) {
+		if (sf->filled || !segfast_refill(cpu, seg) || addr >= sf->lim)
+			return false;
+	}
+	res->res = ADDR_OK1;
+	res->addr1 = sf->base + addr;
+	res->host = sf->host + addr;
+	return true;
+}
+
+/*
+ * The rep string helpers translate once and then walk the address themselves
+ * for as long as they stay inside the page, so the host pointer has to walk
+ * with it.  Staying inside the page is enough to stay inside the run of ram
+ * segfast_refill() found, since that run ends on a page boundary.
+ */
+static inline void optaddr_step(OptAddr *res, int dir)
+{
+	res->addr1 += dir;
+	if (res->host)
+		res->host += dir;
 }
 
 static inline bool translate8(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr)
 {
-	if (likely(translate_nopg(cpu, res, seg, addr)))
+	if (likely(translate_fast(cpu, res, seg, addr)))
 		return true;
 	return translate(cpu, res, rwm, seg, addr, 1, cpu->cpl);
 }
 
 static inline bool translate16(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr)
 {
-	if (likely(translate_nopg(cpu, res, seg, addr)))
+	if (likely(translate_fast(cpu, res, seg, addr)))
 		return true;
 	return translate(cpu, res, rwm, seg, addr, 2, cpu->cpl);
 }
 
 static inline bool translate32(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr)
 {
-	if (likely(translate_nopg(cpu, res, seg, addr)))
+	if (likely(translate_fast(cpu, res, seg, addr)))
 		return true;
 	return translate(cpu, res, rwm, seg, addr, 4, cpu->cpl);
-}
-
-static inline bool in_iomem(uword addr)
-{
-	return (addr >= 0xa0000 && addr < 0xc0000) || addr >= 0xe0000000;
 }
 
 
 static u8 IRAM_ATTR load8(CPUI386 *cpu, OptAddr *res)
 {
+	if (likely(res->host))
+		return hload8(res->host);
 	uword addr = res->addr1;
 	if (in_iomem(addr) && cpu->cb.iomem_read8)
 		return cpu->cb.iomem_read8(cpu->cb.iomem, addr);
@@ -770,6 +897,8 @@ static u8 IRAM_ATTR load8(CPUI386 *cpu, OptAddr *res)
 
 static u16 IRAM_ATTR load16(CPUI386 *cpu, OptAddr *res)
 {
+	if (likely(res->host))
+		return hload16(res->host);
 	if (in_iomem(res->addr1) && cpu->cb.iomem_read16)
 		return cpu->cb.iomem_read16(cpu->cb.iomem, res->addr1);
 	if (unlikely(res->addr1 >= cpu->phys_mem_size)) {
@@ -783,6 +912,8 @@ static u16 IRAM_ATTR load16(CPUI386 *cpu, OptAddr *res)
 
 static u32 IRAM_ATTR load32(CPUI386 *cpu, OptAddr *res)
 {
+	if (likely(res->host))
+		return hload32(res->host);
 	if (in_iomem(res->addr1) && cpu->cb.iomem_read32)
 		return cpu->cb.iomem_read32(cpu->cb.iomem, res->addr1);
 	if (unlikely(res->addr1 >= cpu->phys_mem_size)) {
@@ -807,6 +938,10 @@ static u32 IRAM_ATTR load32(CPUI386 *cpu, OptAddr *res)
 
 static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 {
+	if (likely(res->host)) {
+		hstore8(res->host, val);
+		return;
+	}
 	uword addr = res->addr1;
 	if (in_iomem(addr) && cpu->cb.iomem_write8) {
 		cpu->cb.iomem_write8(cpu->cb.iomem, addr, val);
@@ -820,6 +955,10 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 
 static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 {
+	if (likely(res->host)) {
+		hstore16(res->host, val);
+		return;
+	}
 	if (in_iomem(res->addr1) && cpu->cb.iomem_write16) {
 		cpu->cb.iomem_write16(cpu->cb.iomem, res->addr1, val);
 		return;
@@ -837,6 +976,10 @@ static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 
 static void IRAM_ATTR store32(CPUI386 *cpu, OptAddr *res, u32 val)
 {
+	if (likely(res->host)) {
+		hstore32(res->host, val);
+		return;
+	}
 	if (in_iomem(res->addr1) && cpu->cb.iomem_write32) {
 		cpu->cb.iomem_write32(cpu->cb.iomem, res->addr1, val);
 		return;
@@ -1108,6 +1251,7 @@ static bool read_desc(CPUI386 *cpu, int sel, uword *w1, uword *w2)
 static bool set_seg(CPUI386 *cpu, int seg, int sel)
 {
 	sel = sel & 0xffff;
+	segfast_invalidate1(cpu, seg);
 	if (!(cpu->cr0 & 1) || (cpu->flags & VM)) {
 		cpu->seg[seg].sel = sel;
 		cpu->seg[seg].base = sel << 4;
@@ -1169,6 +1313,7 @@ static inline void clear_segs(CPUI386 *cpu)
 		bool conforming = (w2 >> 8) & 0x4;
 		if (is_dataseg || !conforming) {
 			if (dpl < cpu->cpl) {
+				segfast_invalidate1(cpu, segs[i]);
 				cpu->seg[segs[i]].sel = 0;
 				cpu->seg[segs[i]].base = 0;
 				cpu->seg[segs[i]].limit = 0;
@@ -2668,7 +2813,7 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 			count = countd; \
 		for (uword i = 0; i <= count - 1; i++) { \
 			saddr ## BIT(&memld, ax); \
-			memld.addr1 += dir; \
+			optaddr_step(&memld, dir); \
 		} \
 		sreg ## ABIT(7, lreg ## ABIT(7) + count * dir); \
 		sreg ## ABIT(1, cx - count); \
@@ -2791,8 +2936,8 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		} \
 		for (uword i = 0; i <= count - 1; i++) { \
 			store ## BIT(cpu, &memld, load ## BIT(cpu, &memls)); \
-			memld.addr1 += dir; \
-			memls.addr1 += dir; \
+			optaddr_step(&memld, dir); \
+			optaddr_step(&memls, dir); \
 		} \
 		sreg ## ABIT(6, lreg ## ABIT(6) + count * dir); \
 		sreg ## ABIT(7, lreg ## ABIT(7) + count * dir); \
@@ -2902,7 +3047,7 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		for (uword i = 0; i <= count - 1; i++) { \
 			ax = cpu->cb.io_read ## BIT(cpu->cb.io, lreg16(2)); \
 			saddr ## BIT(&memld, ax); \
-			memld.addr1 += dir; \
+			optaddr_step(&memld, dir); \
 		} \
 		sreg ## ABIT(7, lreg ## ABIT(7) + count * dir); \
 		sreg ## ABIT(1, cx - count); \
@@ -2965,7 +3110,7 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		for (uword i = 0; i <= count - 1; i++) { \
 			ax = laddr ## BIT(&memls); \
 			cpu->cb.io_write ## BIT(cpu->cb.io, lreg16(2), ax); \
-			memls.addr1 += dir; \
+			optaddr_step(&memls, dir); \
 		} \
 		sreg ## ABIT(6, lreg ## ABIT(6) + count * dir); \
 		sreg ## ABIT(1, cx - count); \
@@ -3324,7 +3469,8 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 
 #define LMSW(addr, laddr, saddr) \
 	if (cpu->cpl != 0) THROW(EX_GP, 0); \
-	cpu->cr0 = (cpu->cr0 & ((~0xf) | 1)) | (laddr(addr) & 0xf);
+	cpu->cr0 = (cpu->cr0 & ((~0xf) | 1)) | (laddr(addr) & 0xf); \
+	segfast_invalidate(cpu); /* this can turn protection on */
 
 noinline static bool __LSEGd_helper(CPUI386 *cpu, int adsz16, int seg, int reg, int curr_seg, uword addr)
 {
@@ -3877,6 +4023,8 @@ static uint64_t get_nticks()
 
 static void __sysenter(CPUI386 *cpu, int pl, int cs)
 {
+	segfast_invalidate1(cpu, SEG_CS);
+	segfast_invalidate1(cpu, SEG_SS);
 	cpu->seg[SEG_CS].sel = (cs & 0xfffc) | pl;
 	cpu->seg[SEG_CS].base = 0;
 	cpu->seg[SEG_CS].limit = 0xffffffff;
@@ -5200,6 +5348,8 @@ void cpui386_reset_pm(CPUI386 *cpu, uint32_t start_addr)
 
 	cpu->seg[SEG_DS] = cpu->seg[SEG_SS];
 	cpu->seg[SEG_ES] = cpu->seg[SEG_SS];
+
+	segfast_invalidate(cpu);
 }
 
 void IRAM_ATTR cpui386_raise_irq(CPUI386 *cpu)
