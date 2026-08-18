@@ -446,10 +446,15 @@ int emulink_attach_floppy(EMULINK *e, int i, const char *filename)
 			fclose(e->fdd[i]);
 			e->fdd[i] = NULL;
 		}
-		if (filename)
-			e->fdd[i] = fopen(filename, "r+b");
-		if (!e->fdd[i])
+		if (!filename)
+			return 0; /* ejected */
+
+		e->fdd[i] = fopen(filename, "r+b");
+		if (!e->fdd[i]) {
+			fprintf(stderr, "floppy %c: %s: %s\n",
+				'a' + i, filename, strerror(errno));
 			return -1;
+		}
 		fseek(e->fdd[i], 0, SEEK_END);
 		int size = ftell(e->fdd[i]);
 		for (int j = 0; fmt[j].sectors; j++) {
@@ -459,6 +464,12 @@ int emulink_attach_floppy(EMULINK *e, int i, const char *filename)
 				return 0;
 			}
 		}
+		/* No geometry matches, so the drive would report a size the
+		 * image cannot satisfy; leave it empty rather than attached. */
+		fprintf(stderr, "floppy %c: %s: %d bytes is not a floppy size "
+				"this emulator knows\n", 'a' + i, filename, size);
+		fclose(e->fdd[i]);
+		e->fdd[i] = NULL;
 		return -1;
 	}
 	return 0;

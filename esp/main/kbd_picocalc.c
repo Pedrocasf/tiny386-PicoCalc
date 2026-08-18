@@ -141,6 +141,61 @@ static const uint8_t ascii_to_sc[0x7f - 0x20 + 1] = {
 
 static i2c_master_dev_handle_t s_dev;
 static int s_shift_held;
+static int s_boot_key;
+
+/* 1 = got an event, 0 = FIFO empty, -1 = the MCU did not answer. */
+static int read_event(uint8_t ev[2])
+{
+	uint8_t reg = SB_REG_FIFO;
+
+	if (i2c_master_transmit(s_dev, &reg, 1, 100) != ESP_OK ||
+	    i2c_master_receive(s_dev, ev, 2, 100) != ESP_OK)
+		return -1;
+	return ev[0] != 0 && ev[1] != 0;
+}
+
+#ifdef USE_USB_MSC
+#ifndef USB_MSC_KEY_PROBE_MS
+/* Long enough for the MCU's auto-repeat to produce a second event while the
+ * key is held, at the cost of delaying every normal boot by this much. */
+#define USB_MSC_KEY_PROBE_MS 800
+#endif
+/*
+ * Look for a key held during the first moment after start-up, before the
+ * emulator exists, so it can pick a boot mode.
+ *
+ * The MCU is powered independently and keeps its FIFO across ESP resets, so
+ * anything already queued may be minutes old -- draining it first is what makes
+ * this "held now" rather than "pressed at some point".  A key that is actually
+ * down keeps producing events, so it survives the drain.  Events for other keys
+ * are dropped either way; there is nothing to type into yet.
+ */
+static void probe_boot_key(void)
+{
+	uint8_t ev[2];
+
+	for (int i = 0; i < 64 && read_event(ev) == 1; i++)
+		;
+
+	for (int i = 0; i < USB_MSC_KEY_PROBE_MS / 10; i++) {
+		while (read_event(ev) == 1) {
+			if (ev[1] == USB_MSC_KEY &&
+			    (ev[0] == SB_PRESS || ev[0] == SB_HOLD)) {
+				ESP_LOGW(TAG, "boot key 0x%02x held",
+					 USB_MSC_KEY);
+				s_boot_key = 1;
+				return;
+			}
+		}
+		vTaskDelay(pdMS_TO_TICKS(10));
+	}
+}
+#endif
+
+int kbd_picocalc_boot_key(void)
+{
+	return s_boot_key;
+}
 
 static void put(int is_down, int keycode)
 {
@@ -237,10 +292,9 @@ static void kbd_task(void *arg)
 
 	int link = -1;
 	for (;;) {
-		uint8_t reg = SB_REG_FIFO;
 		uint8_t ev[2];
-		int ok = i2c_master_transmit(s_dev, &reg, 1, 100) == ESP_OK &&
-			 i2c_master_receive(s_dev, ev, sizeof(ev), 100) == ESP_OK;
+		int r = read_event(ev);
+		int ok = r >= 0;
 
 		if (ok != link) {
 			/* a wiring or bus-speed problem shows up here */
@@ -249,7 +303,7 @@ static void kbd_task(void *arg)
 			link = ok;
 		}
 
-		if (ok && ev[0] != 0 && ev[1] != 0) {
+		if (r == 1) {
 #ifdef KBD_DEBUG
 			ESP_LOGI(TAG, "state %d code 0x%02x", ev[0], ev[1]);
 #endif
@@ -289,6 +343,10 @@ void kbd_picocalc_main(void)
 		return;
 	}
 
+#ifdef USE_USB_MSC
+	/* before the polling task starts consuming events */
+	probe_boot_key();
+#endif
 	xTaskCreatePinnedToCore(kbd_task, "kbd_task", 3072, NULL, 1, NULL, 0);
 }
 #endif

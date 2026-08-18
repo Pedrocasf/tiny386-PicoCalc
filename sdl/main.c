@@ -75,8 +75,18 @@ Console *console_init(int width, int height)
 	s->width = width;
 	s->height = height;
 #endif
-	SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
+		fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+		fprintf(stderr, "(no display? use tiny386_headless for a "
+				"machine with no screen)\n");
+		exit(1);
+	}
 	s->screen = SDL_SetVideoMode(s->width, s->height, BPP, 0);
+	if (!s->screen) {
+		fprintf(stderr, "cannot open a %dx%d %d bpp window: %s\n",
+			s->width, s->height, BPP, SDL_GetError());
+		exit(1);
+	}
 	SDL_EnableKeyRepeat(SDL_DEFAULT_REPEAT_DELAY,
 			    SDL_DEFAULT_REPEAT_INTERVAL);
 	SDL_WM_SetCaption("tiny386 - use ctrl + ] to grab/ungrab", NULL);
@@ -95,7 +105,25 @@ static void redraw(void *opaque,
 	SDL_PumpEvents();
 }
 
-/* we assume Xorg is used with a PC keyboard. Return 0 if no keycode found. */
+/*
+ * X11 reports keycodes as Linux input keycodes plus 8, so that is subtracted
+ * below to get back to the Linux numbering ps2_put_keycode() wants.  The other
+ * drivers -- fbcon on a framebuffer console, directfb -- report the Linux
+ * keycode directly, and subtracting there shifts every key by eight: enter
+ * (28) arrives as 20, which is the scancode for 't'.
+ */
+static int sdl_keycode_offset(void)
+{
+	static int offset = -1;
+	if (offset < 0) {
+		char name[16] = "";
+		SDL_VideoDriverName(name, sizeof(name));
+		offset = strcmp(name, "x11") == 0 ? 8 : 0;
+	}
+	return offset;
+}
+
+/* Return 0 if no keycode found. */
 static int sdl_get_keycode(const SDL_KeyboardEvent *ev)
 {
 	int keycode = ev->keysym.scancode;
@@ -120,10 +148,11 @@ static int sdl_get_keycode(const SDL_KeyboardEvent *ev)
 	default: if (keycode == 0) return 0;
 	}
 #ifndef _WIN32
-	if (keycode < 9) {
+	int off = sdl_keycode_offset();
+	if (keycode < off + 1) {
 		keycode = 0;
-	} else if (keycode < 127 + 9) {
-		keycode -= 8;
+	} else if (keycode < 127 + off + 1) {
+		keycode -= off;
 	} else {
 		keycode = 0;
 	}

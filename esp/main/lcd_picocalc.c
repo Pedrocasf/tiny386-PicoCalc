@@ -269,7 +269,10 @@ void vga_task(void *arg)
 	int64_t step_us = 0, mark_draw = 0, mark_spi = 0;
 	while (1) {
 		int64_t t0 = esp_timer_get_time();
+#ifndef CPU_BENCH	/* leave the panel idle, so the benchmark has the
+			 * memory system to itself */
 		pc_vga_step(globals.pc);
+#endif
 		int64_t now = esp_timer_get_time();
 		step_us += now - t0;
 		vTaskDelay(10 / portTICK_PERIOD_MS);

@@ -23,6 +23,7 @@ idf_component_register(SRCS "esp_main.c"
 "lcd_picocalc.c"
 "lcd_stub.c"
 "kbd_picocalc.c"
+"usb_msc.c"
 "sdmmc_crc_wrap.c"
 "i2s.c"
 "storage.c"
@@ -51,6 +52,8 @@ add_definitions(-DUSE_FMOPL)
 set_source_files_properties("../../adlib.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("../../fmopl.c" PROPERTIES COMPILE_FLAGS "-Wno-all -fsingle-precision-constant")
 set_source_files_properties("../../fpu.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
+# Note: adding -fjump-tables -ftree-switch-conversion here (IDF disables both
+# globally) was measured and made no difference, so it is left off.
 set_source_files_properties("../../i386.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("../../i8042.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("../../vga.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
