@@ -1214,7 +1214,21 @@ static inline bool modsib16(CPUI386 *cpu, int mod, int rm, uword *addr, int *seg
 	return true;
 }
 
-static bool IRAM_ATTR modsib(CPUI386 *cpu, int adsz16, int mod, int rm, uword *addr, int *seg)
+/*
+ * Worth forcing inline: this sits on every memory operand, and left to
+ * itself gcc emits one out of line copy called from 274 sites, with the
+ * address and segment handed back through stack slots that the caller
+ * immediately reads again.  Inlining it cost 21% of the size of cpu_exec1
+ * and returned 5% on a mixed instruction benchmark measured on a cortex-a7.
+ *
+ * Inlining __GE_helper as well is not worth it, though the single
+ * instruction benchmarks say otherwise: it makes the forms that go through
+ * that helper 22% faster and everything else slower, netting to nothing on a
+ * realistic blend while costing another 8% of code size.  Measure any change
+ * here against the mixed row, not the single instruction rows.
+ */
+static inline __attribute__((always_inline)) bool IRAM_ATTR
+modsib(CPUI386 *cpu, int adsz16, int mod, int rm, uword *addr, int *seg)
 {
 	if (adsz16) return modsib16(cpu, mod, rm, addr, seg);
 	else return modsib32(cpu, mod, rm, addr, seg);
