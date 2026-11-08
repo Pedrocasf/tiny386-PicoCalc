@@ -1,4 +1,4 @@
-// addapted from llvm/compiler-rt
+// adapted from llvm/compiler-rt
 #include <stdint.h>
 typedef __int128 int128_t;
 typedef unsigned __int128 uint128_t;

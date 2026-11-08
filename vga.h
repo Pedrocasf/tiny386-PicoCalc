@@ -2,6 +2,7 @@
 #define VGA_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef struct FBDevice FBDevice;
 
@@ -37,5 +38,13 @@ PCIDevice *vga_pci_init(VGAState *s, PCIBus *bus,
 #ifndef BPP
 #define BPP 32
 #endif
+
+typedef struct VGATextOps {
+    void (*set_cursor)(void *o, int y, int x);
+    void (*put_char2)(void *o, int y, int x, int ch, int attr);
+    void (*refresh)(void *o, const uint8_t *ram, int w, int h);
+} VGATextOps;
+
+void vga_set_text_ops(VGAState *s, VGATextOps *ops, void *o);
 
 #endif /* VGA_H */

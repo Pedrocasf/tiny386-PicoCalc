@@ -1,3 +1,6 @@
+/* Only with USE_CPUABS (see the Makefile), which needs Linux's KVM on an
+   x86 host: elsewhere this file is empty, so that `gcc *.c` builds. */
+#ifdef USE_CPUABS
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,17 +14,6 @@
 #include <signal.h>
 #include <sys/time.h>
 #include <errno.h>
-
-typedef uint32_t u32;
-typedef uint16_t u16;
-typedef uint8_t u8;
-
-typedef int32_t s32;
-typedef int16_t s16;
-typedef int8_t s8;
-
-typedef u32 uword;
-typedef s32 sword;
 
 #include "kvm.h"
 #define PAGE_SIZE 4096
@@ -331,6 +323,14 @@ static void flush_coalesced_mmio_buffer(CPUKVM *cpu)
 				case 4:
 					cpu->cb.iomem_write32(cpu->cb.iomem, addr, *(u32 *) data);
 					break;
+				case 8:
+#ifdef USE_AMD64
+					cpu->cb.iomem_write64(cpu->cb.iomem, addr, *(u64 *) data);
+#else
+					cpu->cb.iomem_write32(cpu->cb.iomem, addr, *(u32 *) data);
+					cpu->cb.iomem_write32(cpu->cb.iomem, addr + 4, *((u32 *) data + 1));
+#endif
+					break;
 				default:
 					abort();
 				}
@@ -443,6 +443,14 @@ void cpukvm_step(CPUKVM *cpu, int stepcount)
 			case 4:
 				cpu->cb.iomem_write32(cpu->cb.iomem, addr, *(u32 *) data);
 				break;
+			case 8:
+#ifdef USE_AMD64
+				cpu->cb.iomem_write64(cpu->cb.iomem, addr, *(u64 *) data);
+#else
+				cpu->cb.iomem_write32(cpu->cb.iomem, addr, *(u32 *) data);
+				cpu->cb.iomem_write32(cpu->cb.iomem, addr + 4, *((u32 *) data + 1));
+#endif
+				break;
 			default:
 				abort();
 			}
@@ -456,6 +464,14 @@ void cpukvm_step(CPUKVM *cpu, int stepcount)
 				break;
 			case 4:
 				*(u32 *) data = cpu->cb.iomem_read32(cpu->cb.iomem, addr);
+				break;
+			case 8:
+#ifdef USE_AMD64
+				*(u64 *) data = cpu->cb.iomem_read64(cpu->cb.iomem, addr);
+#else
+				*(u32 *) data = cpu->cb.iomem_read32(cpu->cb.iomem, addr);
+				*((u32 *) data + 1) = cpu->cb.iomem_read32(cpu->cb.iomem, addr + 4);
+#endif
 				break;
 			default:
 				abort();
@@ -496,3 +512,4 @@ long cpukvm_get_cycle(CPUKVM *cpu)
 {
 	return cpu->cycle;
 }
+#endif /* USE_CPUABS */

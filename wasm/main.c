@@ -97,11 +97,11 @@ Console *wasm_init(PCConfig *conf)
 }
 
 WASM_EXPORT
-int wasm_loop(Console *console)
+int wasm_loop_ex(Console *console, int count)
 {
 	PC *pc = console->pc;
 
-	for (int i = 0; i < 64 && pc->shutdown_state != 8; i++) {
+	for (int i = 0; i < count && pc->shutdown_state != 8; i++) {
 		pc_step(pc);
 		pc_vga_step(pc);
 	}
@@ -110,6 +110,12 @@ int wasm_loop(Console *console)
 		return 1;
 	}
 	return 0;
+}
+
+WASM_EXPORT
+int wasm_loop(Console *console)
+{
+	return wasm_loop_ex(console, 64);
 }
 
 WASM_EXPORT

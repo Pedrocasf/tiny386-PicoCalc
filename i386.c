@@ -124,6 +124,25 @@ struct CPUI386 {
 	struct {
 		uword cs, eip, esp;
 	} sysenter;
+
+#ifdef AMD64_ENABLE_LEG32
+	struct {
+		u32 efer;
+	} lm;
+#define INIT_LM_EFER(cpu) ((cpu)->lm.efer = 0)
+#define GET_LM_EFER(cpu) ((cpu)->lm.efer)
+#define SET_LM_EFER(cpu, x) ((cpu)->lm.efer = (x))
+#define CPUID_LM0_2 0x2048
+#define CPUID_LM80_0 0x80000004
+#define CPUID_LM81_2 ((1<<29) | (1<<11))
+#else
+#define INIT_LM_EFER(cpu)
+#define GET_LM_EFER(cpu) 0
+#define SET_LM_EFER(cpu, x) THROW(EX_GP, 0)
+#define CPUID_LM0_2 0
+#define CPUID_LM80_0 0
+#define CPUID_LM81_2 0
+#endif
 };
 
 #define dolog(...) fprintf(stderr, __VA_ARGS__)
@@ -244,8 +263,10 @@ static inline void hstore8(u8 *p, u8 val)
 }
 
 #ifdef I386_OPT1
-/* only works on hosts that are little-endian and support unaligned access */
-#ifdef __mips__
+/* only works on hosts that are little-endian; where unaligned loads and
+   stores trap or are slow, the packed accesses below let the compiler take
+   them apart (on MIPS always, elsewhere with -DI386_ALIGNED_ONLY) */
+#if defined(__mips__) || defined(I386_ALIGNED_ONLY)
 static inline u16 hload16(const u8 *p)
 {
 	const struct { u16 v; } __attribute__((packed)) *q = (const void *) p;
@@ -575,6 +596,8 @@ typedef struct {
 	u8 *host;
 } OptAddr;
 
+static unsigned tlb_gen; /* counts TLB clears (fast/fast.h keeps a TLB of its own) */
+
 static void segfast_invalidate1(CPUI386 *cpu, int seg)
 {
 	cpu->segfast[seg].lim = 0;
@@ -592,6 +615,7 @@ static void tlb_clear(CPUI386 *cpu)
 	/* every reason to drop the tlb -- a cr3 write, a paging or protection
 	 * change, a reset -- is also a reason to drop the segment fast path */
 	segfast_invalidate(cpu);
+	tlb_gen++;
 	for (int i = 0; i < tlb_size; i++) {
 		cpu->tlb.tab[i].lpgno = -1;
 	}
@@ -599,7 +623,7 @@ static void tlb_clear(CPUI386 *cpu)
 	cpu->ifetch.paddr = 0;
 }
 
-static int pte_lookup[2][4][2][2] = { //[wp != 0][(pte >> 1) & 3][cpl > 0][rwm > 1]
+static int pte_lookup[2][4][2][2] = { //[wp != 0][(pte >> 1) & 3][cpl == 3][rwm > 1]
 	{ // wp == 0
 		{ {0, 0}, {1, 1} }, // s,r
 		{ {0, 0}, {1, 1} }, // s,w
@@ -616,6 +640,15 @@ static int pte_lookup[2][4][2][2] = { //[wp != 0][(pte >> 1) & 3][cpl > 0][rwm >
 
 static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgno)
 {
+	if (unlikely(GET_LM_EFER(cpu))) {
+		static u8 _[8];
+		ent->lpgno = lpgno;
+		ent->xaddr = 0;
+		ent->pte_lookup = pte_lookup[1][3];
+		ent->ppte = _;
+		return true;
+	}
+
 	uword base_addr = cpu->cr3 & ~0xfff;
 	uword i = lpgno >> 10;
 	uword j = lpgno & 1023;
@@ -652,18 +685,18 @@ static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword 
 			cpu->excerr = 0;
 			if (rwm & 2)
 				cpu->excerr |= 2;
-			if (cpl)
+			if (cpl == 3)
 				cpu->excerr |= 4;
 			return false;
 		}
 	}
-	if (ent->pte_lookup[cpl > 0][rwm > 1]) {
+	if (ent->pte_lookup[cpl == 3][rwm > 1]) {
 		cpu->cr2 = laddr;
 		cpu->excno = EX_PF;
 		cpu->excerr = 1;
 		if (rwm & 2)
 			cpu->excerr |= 2;
-		if (cpl)
+		if (cpl == 3)
 			cpu->excerr |= 4;
 		ent->lpgno = -1;
 		return false;
@@ -749,16 +782,16 @@ static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword add
 				cpu->cr2 = laddr;
 				cpu->excno = EX_PF;
 				cpu->excerr = 0;
-				if (cpu->cpl)
+				if (cpu->cpl == 3)
 					cpu->excerr |= 4;
 				return false;
 			}
 		}
-		if (ent->pte_lookup[cpu->cpl > 0][0]) {
+		if (ent->pte_lookup[cpu->cpl == 3][0]) {
 			cpu->cr2 = laddr;
 			cpu->excno = EX_PF;
 			cpu->excerr = 1;
-			if (cpu->cpl)
+			if (cpu->cpl == 3)
 				cpu->excerr |= 4;
 			ent->lpgno = -1;
 			return false;
@@ -1308,6 +1341,12 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 	if (seg == SEG_CS) {
 //		if ((sel & 3) != cpu->cpl)
 //			dolog("set_seg: PVL %d => %d\n", cpu->cpl, sel & 3);
+#ifdef AMD64_ENABLE_LEG32
+		// go to long mode
+		if (w2 & (1<< 21)) {
+			THROW(0x8664, 0);
+		}
+#endif
 		cpu->cpl = sel & 3;
 		cpu->code16 = !(cpu->seg[SEG_CS].flags & SEG_D_BIT);
 	}
@@ -1718,7 +1757,7 @@ static inline void clear_segs(CPUI386 *cpu)
 	}
 
 #define Jv(rwm, INST) \
-	if (adsz16) { \
+	if (opsz16) { \
 		u16 imm16; \
 		TRY(fetch16(cpu, &imm16)); \
 		INST ## w(imm16, limm, 0); \
@@ -2480,8 +2519,27 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 #define IRET() \
 	if ((cpu->cr0 & 1) && (!(cpu->flags & VM) || get_IOPL(cpu) < 3)) { \
 		TRY(pmret(cpu, opsz16, 0, true)); \
+	} else if (!opsz16) { \
+		/* IRETD in real mode (V86 too): EIP, CS in a 32-bit slot, EFLAGS; real mode keeps VM, VIF and VIP, V86 IOPL \
+		   as well (the 386 manual's IRET) */ \
+		OptAddr meml1, meml2, meml3; \
+		uword sp = lreg32(4); \
+		/* ip */ TRY(translate32(cpu, &meml1, 1, SEG_SS, sp & sp_mask)); \
+		uword newip = laddr32(&meml1); \
+		/* cs */ TRY(translate32(cpu, &meml2, 1, SEG_SS, (sp + 4) & sp_mask)); \
+		int newcs = laddr32(&meml2) & 0xffff; \
+		/* flags */ TRY(translate32(cpu, &meml3, 1, SEG_SS, (sp + 8) & sp_mask)); \
+		uword newflags = laddr32(&meml3); \
+		uword oldflags = cpu->flags; \
+		if (cpu->flags & VM) cpu->flags = (newflags & ~(IOPL | VM | 0x180000)) | (cpu->flags & (IOPL | VM | 0x180000)); \
+		else cpu->flags = (newflags & 0x257fd5) | (cpu->flags & 0x1a0000); \
+		cpu->flags &= EFLAGS_MASK; \
+		cpu->flags |= 0x2; \
+		if (!set_seg(cpu, SEG_CS, newcs)) { cpu->flags = oldflags; return false; } \
+		cpu->cc.mask = 0; \
+		set_sp(sp + 12, sp_mask); \
+		cpu->next_ip = newip; \
 	} else { \
-		if (!opsz16) cpu_abort(cpu, -201); \
 		OptAddr meml1, meml2, meml3; \
 		uword sp = lreg32(4); \
 		/* ip */ TRY(translate16(cpu, &meml1, 1, SEG_SS, sp & sp_mask)); \
@@ -3633,7 +3691,7 @@ noinline static void __AAM_helper(CPUI386 *cpu, u8 i)
 	cpu->cc.dst = sext8(res); \
 	cpu->cc.mask = ZF | SF | PF;
 }
-#define AAM(i, li, _) __AAM_helper(cpu, li(i));
+#define AAM(i, li, _) if (li(i) == 0) THROW0(EX_DE); __AAM_helper(cpu, li(i));
 
 #define SALC() \
 	if (get_CF(cpu)) sreg8(0, 0xff); else sreg8(0, 0x00);
@@ -3960,7 +4018,7 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 	case 1: \
 		REGi(0) = 0 | (0 << 4) | (cpu->gen << 8); \
 		REGi(3) = 0; \
-		REGi(2) = 0x100; \
+		REGi(2) = 0x110; \
 		REGi(1) = 0; \
 		if (cpu->fpu) REGi(2) |= 1; \
 		if (cpu->gen > 5) REGi(2) |= 0x8820; \
@@ -3968,6 +4026,19 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 			REGi(2) |= CPUID_SIMD_FEATURE; \
 			REGi(1) |= CPUID_SIMD_FEATURE2; \
 		} \
+		REGi(2) |= CPUID_LM0_2; \
+		break; \
+	case 0x80000000: \
+		REGi(0) = CPUID_LM80_0; \
+		REGi(3) = 0; \
+		REGi(2) = 0; \
+		REGi(1) = 0; \
+		break; \
+	case 0x80000001: \
+		REGi(0) = 0; \
+		REGi(3) = 0; \
+		REGi(2) = CPUID_LM81_2; \
+		REGi(1) = 1; \
 		break; \
 	default: \
 		REGi(0) = 0; \
@@ -4023,6 +4094,7 @@ static uint64_t get_nticks()
 	case 0x174: cpu->sysenter.cs = REGi(0); break; \
 	case 0x176: cpu->sysenter.eip = REGi(0); break; \
 	case 0x175: cpu->sysenter.esp = REGi(0); break; \
+	case 0xc0000080: SET_LM_EFER(cpu,REGi(0) & ~(1<<10)); break; \
 	default: cpu_debug(cpu); THROW(EX_GP, 0); \
 	}
 
@@ -4032,6 +4104,7 @@ static uint64_t get_nticks()
 	case 0x174: REGi(0) = cpu->sysenter.cs; REGi(2) = 0; break; \
 	case 0x176: REGi(0) = cpu->sysenter.eip; REGi(2) = 0; break; \
 	case 0x175: REGi(0) = cpu->sysenter.esp; REGi(2) = 0; break; \
+	case 0xc0000080: REGi(0) = GET_LM_EFER(cpu); REGi(2) = 0; break; \
 	default: cpu_debug(cpu); THROW(EX_GP, 0); \
 	}
 
@@ -4473,6 +4546,7 @@ static bool task_switch(CPUI386 *cpu, int tss, int sw_type)
 	cpu->flags = load32(cpu, &meml);
 	cpu->flags &= EFLAGS_MASK;
 	cpu->flags |= 0x2;
+	cpu->cc.mask = 0;	/* the new task's flags, not the old one's last operation's */
 	if (sw_type == TS_CALL) {
 		TRY1(translate(cpu, &meml, 2, SEG_TR, 0, 4, 0));
 		store32(cpu, &meml, oldtss);
@@ -4538,7 +4612,15 @@ static bool pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp)
 		}
 //		if ((sel & 3) != cpu->cpl)
 //			dolog("pmcall PVL %d => %d\n", cpu->cpl, sel & 3);
-		TRY1(set_seg(cpu, SEG_CS, sel));
+		if (!set_seg(cpu, SEG_CS, sel)) {
+#ifdef AMD64_ENABLE_LEG32
+			if (cpu->excno == 0x8664) {
+				cpu->ip = addr;
+				return false;
+			}
+#endif
+			TRY1(false);
+		}
 		cpu->next_ip = addr;
 	} else {
 		int newcs = w1 >> 16;
@@ -4779,7 +4861,7 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		saddr16(&meml1, cpu->flags);
 		saddr16(&meml2, cpu->seg[SEG_CS].sel);
 		saddr16(&meml3, cpu->ip);
-		sreg32(4, (sp - 2 * 3) & sp_mask);
+		set_sp(sp - 2 * 3, sp_mask);
 
 		TRY1(set_seg(cpu, SEG_CS, newcs));
 		cpu->next_ip = newip;
@@ -4818,8 +4900,19 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 	}
 
 	/* task gate */
-	if (gt == 5)
-		return task_switch(cpu, w1 >> 16, TS_CALL);
+	if (gt == 5) {
+		TRY(task_switch(cpu, w1 >> 16, TS_CALL));
+		/* an exception's error code goes onto the new task's stack (a 32-bit TSS's: 4 bytes) */
+		if (pusherr) {
+			OptAddr meml1;
+			uword sp = lreg32(4);
+			uword sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
+			TRY(translate(cpu, &meml1, 2, SEG_SS, (sp - 4) & sp_mask, 4, cpu->cpl));
+			saddr32(&meml1, cpu->excerr);
+			set_sp(sp - 4, sp_mask);
+		}
+		return true;
+	}
 
 	/* TRAP-OR-INTERRUPT-GATE */
 	int newcs = w1 >> 16;
@@ -5190,7 +5283,18 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 //			dolog("pmiret PVL %d => %d %04x:%08x\n", cpu->cpl, newcs & 3, newcs, newip);
 			if (isiret)
 				cpu->flags = newflags;
-			TRY1(set_seg(cpu, SEG_CS, newcs));
+			if (!set_seg(cpu, SEG_CS, newcs)) {
+#ifdef AMD64_ENABLE_LEG32
+				if (cpu->excno == 0x8664) {
+					cpu->ip = newip;
+					set_sp(sp + 8 + off, sp_mask);
+					if (isiret)
+						cpu->cc.mask = 0;
+					return false;
+				}
+#endif
+				TRY1(false);
+			}
 
 			if (opsz16) {
 				set_sp(sp + 4 + off, sp_mask);
@@ -5251,6 +5355,10 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 	int ret = cpu_exec1(cpu, stepcount);
 	cpu->ifetch.paddr = 0;
 	if (!ret) {
+#ifdef AMD64_ENABLE_LEG32
+		if (cpu->excno == 0x8664)
+			return;
+#endif
 		bool pusherr = false;
 		switch (cpu->excno) {
 		case EX_DF: case EX_TS: case EX_NP: case EX_SS: case EX_GP:
@@ -5337,10 +5445,13 @@ void cpui386_reset(CPUI386 *cpu)
 
 	cpu->cc.mask = 0;
 	tlb_clear(cpu);
+	cpu->excno = 0;
+	cpu->excerr = 0;
 
 	cpu->sysenter.cs = 0;
 	cpu->sysenter.eip = 0;
 	cpu->sysenter.esp = 0;
+	INIT_LM_EFER(cpu);
 }
 
 void cpui386_reset_pm(CPUI386 *cpu, uint32_t start_addr)
@@ -5432,7 +5543,34 @@ void cpui386_delete(CPUI386 *cpu)
 {
 	if (cpu->fpu)
 		fpu_delete(cpu->fpu);
+#ifndef BUILD_ESP32
+	free(cpu->tlb.tab);
+#endif
 	free(cpu);
+}
+
+void cpui386_get_state(CPUI386 *cpu, CPUI386_State *state)
+{
+	refresh_flags(cpu);
+	for (int i = 0; i < 8; i++)
+		state->gpr[i] = REGi(i);
+	for (int i = 0; i < 8; i++)
+		state->seg[i] = cpu->seg[i].sel;
+	state->ip = cpu->ip;
+	state->flags = cpu->flags;
+	state->gdt_base = cpu->gdt.base;
+	state->gdt_limit = cpu->gdt.limit;
+	state->idt_base = cpu->idt.base;
+	state->idt_limit = cpu->idt.limit;
+	state->cr0 = cpu->cr0;
+	state->cr2 = cpu->cr2;
+	state->cr3 = cpu->cr3;
+	state->efer = GET_LM_EFER(cpu);
+}
+
+int cpui386_get_excno(CPUI386 *cpu)
+{
+	return cpu->excno;
 }
 
 #if !defined(_WIN32) && !defined(__wasm__)

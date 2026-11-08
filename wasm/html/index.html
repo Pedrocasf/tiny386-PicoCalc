@@ -36,14 +36,24 @@
                 if (inst === null) {
                     inst = get_tiny386(document.getElementById('screen'));
                     const o = document.getElementById('logarea');
-                    inst.set_logger(function (s) {
-                        const len = o.value.length;
-                        if (len > 40960)
-                            o.value = o.value.substring(len - 40960, len) + s;
-                        else
-                            o.value += s;
-                        o.scrollTop = o.scrollHeight;
+                    const logbuf = [];
+                    let rending = false;
+                    inst.set_logger(function (message) {
+                        logbuf.push(message);
+                        if (logbuf.length > 2000) {
+                            logbuf.shift();
+                        }
+
+                        if (!rending) {
+                            rending = true;
+                            requestAnimationFrame(() => {
+                                o.value = logbuf.join('');
+                                o.scrollTop = o.scrollHeight;
+                                rending = false;
+                            });
+                        }
                     });
+
                     const inifile = document.getElementById('configname').value;
                     inst.start(inifile);
                 }

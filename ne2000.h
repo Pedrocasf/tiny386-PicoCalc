@@ -15,5 +15,6 @@ void ne2000_step(NE2000State *s);
 NE2000State *isa_ne2000_init(int base, int irq,
                              void *pic,
                              void (*set_irq)(void *pic, int irq, int level));
-
+// XXX
+void ne2000_set_config_file(const char *file);
 #endif /* NE2000_H */
