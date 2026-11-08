@@ -154,12 +154,10 @@ Console *console_init(int width, int height)
 #ifndef ANDROID
 	if (CNFGSetup("tiny386 - use ctrl + ] to grab/ungrab",
 		      s->width, s->height) < 0) {
-		fprintf(stderr, "cannot open a %dx%d window
-",
+		fprintf(stderr, "cannot open a %dx%d window\n",
 			s->width, s->height);
 		fprintf(stderr, "(no display? use tiny386_headless for a "
-				"machine with no screen)
-");
+				"machine with no screen)\n");
 		exit(1);
 	}
 #else
