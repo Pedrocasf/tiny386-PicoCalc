@@ -19,6 +19,10 @@ typedef char *gchar;
 typedef int gint;
 typedef _Bool gboolean;
 
+#ifndef  _WIN32
+#define G_OS_UNIX
+#endif
+
 #define G_GNUC_PRINTF(...)
 #define G_STATIC_ASSERT _Static_assert
 #define G_UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -61,6 +65,15 @@ static char *g_strdup(const char *s)
 {
 	if (s) return strdup(s);
 	return NULL;
+}
+
+static size_t g_strlcpy(char *d, const char *s, size_t n)
+{
+	char *d0 = d;
+	if (!n--) return strlen(s);
+	for (; n && (*d=*s); n--, s++, d++);
+	*d = 0;
+	return d - d0 + strlen(s);
 }
 
 static void *g_malloc0(size_t size)

@@ -1,6 +1,7 @@
 'use strict';
 
-function get_tiny386(screen) {
+function get_tiny386(screen, wasm_name) {
+if (wasm_name === undefined) wasm_name = 'tiny386.wasm';
 
 let mem8;
 let logger = null;
@@ -36,9 +37,10 @@ function exit(status)
     throw new Error('wasm exit with ' + status);
 }
 
+let mticks_offset = 0;
 function __get_mticks()
 {
-    return Date.now();
+    return Date.now() + mticks_offset;
 }
 
 function dolog(s)
@@ -451,7 +453,7 @@ function loads(files, i, cont) {
 
 function start(inifile)
 {
-    fetch('tiny386.wasm', fetchopt)
+    fetch(wasm_name, fetchopt)
         .then(response => response.arrayBuffer())
         .then(bytes => WebAssembly.compile(bytes))
         .then(module => new WebAssembly.Instance(module, imports))
@@ -478,33 +480,30 @@ function start(inifile)
                         const audlen = instance.exports.wasm_getaudiolen(h2);
                         const mf32 = new Float32Array(instance.exports.memory.buffer);
 
-                        const n = 8;
-                        const dummybuf = audctx.createBuffer(1, audlen * n, 44100);
-                        const dummysrc = audctx.createBufferSource();
+                        const n = 3;
+                        let next = audctx.currentTime;
+                        function run_audio() {
+                            while (next < audctx.currentTime + 0.2) {
+                                const audioBuffer = audctx.createBuffer(2, audlen * n, 44100);
 
-                        const audcb = audctx.createScriptProcessor(audlen * n, 1, 2);
-                        audcb.addEventListener(
-                            "audioprocess",
-                            (ev) => {
-                                const out = ev.outputBuffer;
                                 for (let j = 0; j < n; j++) {
-                                    const ap =
-                                          instance.exports.wasm_getaudio_f32(h2) / 4;
+                                    const ap = instance.exports.wasm_getaudio_f32(h2) / 4;
                                     for (let ch = 0; ch < 2; ch++) {
-                                        const buf = out.getChannelData(ch);
+                                        const buf = audioBuffer.getChannelData(ch);
                                         const off = audlen * ch;
-                                        for (let i = 0; i < audlen; i++) {
-                                            buf[audlen * j + i] = mf32[ap + off + i];
-                                        }
+                                        buf.set(mf32.subarray(ap + off,
+                                                              ap + off + audlen),
+                                                audlen * j);
                                     }
                                 }
-                            });
-                        audcb.connect(audctx.destination);
 
-                        dummysrc.buffer = dummybuf;
-                        dummysrc.loop = true;
-                        dummysrc.connect(audcb);
-                        dummysrc.start();
+                                const source = audctx.createBufferSource();
+                                source.buffer = audioBuffer;
+                                source.connect(audctx.destination);
+                                source.start(next);
+                                next += audioBuffer.duration;
+                            }
+                        }
 
                         // networking
                         import('tcpip').then(tcpip => {
@@ -565,12 +564,14 @@ function start(inifile)
                         });
 
                         running = true;
-                        function main_loop() {
-                            instance.exports.wasm_loop(h2);
-                            if (running)
-                                setTimeout(main_loop, 0);
-                        }
-                        main_loop();
+                        const loop = new MessageChannel();
+                        loop.port1.onmessage = () => {
+                            if (!running) return;
+                            instance.exports.wasm_loop_ex(h2, 2);
+                            run_audio();
+                            loop.port2.postMessage(0);
+                        };
+                        loop.port2.postMessage(0);
 
                         function redraw_loop() {
                             drawfb(fbptr, width, height);
@@ -599,5 +600,6 @@ return {
     send_mouse: function(x, y, z, btn) {
         instance.exports.wasm_send_mouse(h2, x, y, z, btn);
     },
+    set_mticks_offset: function (off) { mticks_offset = off; },
 }
 }

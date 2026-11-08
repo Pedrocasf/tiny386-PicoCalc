@@ -2,13 +2,21 @@ Q = @
 CC_ = gcc
 CC_win32 = i686-w64-mingw32-gcc
 CC = ${CC_${PLAT}}
+LD_ = ld
+LD_win32 = i686-w64-mingw32-ld
+LD = ${LD_${PLAT}}
+OBJCOPY_ = objcopy
+OBJCOPY_win32 = i686-w64-mingw32-objcopy
+OBJCOPY = ${OBJCOPY_${PLAT}}
 HOSTCC = ${CC}
 
 SDL_CONFIG = sdl-config
 SLIRP_INC =
 SLIRP_LIB = -lslirp
 
-CFLAGS = -I . -Wall -O3 -ffunction-sections -fdata-sections -g -Wl,--gc-sections
+CFLAGS_ = -I . -Wall -O3 -ffunction-sections -fdata-sections -g -Wl,--gc-sections
+CFLAGS_win32 = -I . -Wall -O3 -ffunction-sections -g -Wl,--gc-sections
+CFLAGS = ${CFLAGS_${PLAT}}
 CFLAGS += -DI386_ENABLE_FPU
 CFLAGS += -DI386_ENABLE_MMX -DI386_ENABLE_SSE -DI386_ENABLE_SSE2 -DI386_ENABLE_SSE3
 CFLAGS += -DI386_ENABLE_SSSE3
@@ -46,10 +54,13 @@ LIBS_RAWDRAW = ${LIBS_RAWDRAW_${PLAT}}
 #USE_SDL = y/n
 USE_SDL = n
 
-#USE_FMOPL = y/n
+#USE_FMOPL = y/n/nuked_opl3
 USE_FMOPL = y
 FMOPL_y = fmopl.c
 CFLAGS_FMOPL_y = -DUSE_FMOPL
+NUKED_OPL3_DIR = build/Nuked-OPL3
+FMOPL_nuked_opl3 = ${NUKED_OPL3_DIR}/opl3.c
+CFLAGS_FMOPL_nuked_opl3 = -DUSE_NUKED_OPL3 -I${NUKED_OPL3_DIR}
 CFLAGS += ${CFLAGS_FMOPL_${USE_FMOPL}}
 
 #USE_CPUABS = y/n
@@ -91,47 +102,110 @@ CFLAGS += ${CFLAGS_${ENABLE_CISO}}
 LIBS += ${LIBS_${ENABLE_CISO}}
 SRCS += ${SRCS_${ENABLE_CISO}}
 
-#USE_AMD64 = n/y
+#USE_FAST = n/y/pd: a fast path in front of i386.c's interpreter (fast/; with USE_AMD64 = n), pd: with pre-decoding
+USE_FAST = n
+CFLAGS_FAST_y = -DUSE_FAST
+CFLAGS_FAST_pd = -DUSE_FAST -DFAST_PD
+CFLAGS += ${CFLAGS_FAST_${USE_FAST}}
+SRCS_I386_n = i386.c
+SRCS_I386_y = fast/fast.c
+SRCS_I386_pd = fast/fast.c
+
+#USE_AMD64 = n/y/full
 USE_AMD64 = n
 CFLAGS_AMD64_y = -DUSE_AMD64
-SRCS_AMD64_y = amd64.c
-SRCS_AMD64_n = i386.c
+CFLAGS_AMD64_full = -DUSE_AMD64 -DAMD64_ENABLE_LEG32
+SRCS_AMD64_n = ${SRCS_I386_${USE_FAST}} fpu.c
+SRCS_AMD64_y = amd64.c fpu.c
+SRCS_AMD64_full = amd64-comb.o i386-comb.o
 CFLAGS += ${CFLAGS_AMD64_${USE_AMD64}}
 SRCS += ${SRCS_AMD64_${USE_AMD64}}
+
+#ENABLE_RAWDRAW_WAYLAND = n/y
+ENABLE_RAWDRAW_WAYLAND = n
+CFLAGS_RAWDRAW_WAYLAND_y = -DCNFG_WAYLAND
+CFLAGS += ${CFLAGS_RAWDRAW_WAYLAND_${ENABLE_RAWDRAW_WAYLAND}}
+PREPARE_WAYLAND_y = prepare_wayland
+PREPARE_WAYLAND = ${PREPARE_WAYLAND_${ENABLE_RAWDRAW_WAYLAND}}
 
 PROGS_ = tiny386 tiny386_headless wifikbd initnet
 PROGS_win32 = tiny386 tiny386_headless wifikbd
 PROGS = ${PROGS_${PLAT}}
 
-SRCS += ini.c fpu.c i8259.c i8254.c ide.c vga.c i8042.c misc.c adlib.c ne2000.c i8257.c sb16.c pcspk.c
+SRCS += ini.c i8259.c i8254.c ide.c vga.c vgafont.c i8042.c misc.c adlib.c ne2000.c i8257.c sb16.c pcspk.c
 SRCS += ${FMOPL_${USE_FMOPL}}
 SRCS += ${CPUABS_${USE_CPUABS}}
 SRCS += pc.c
 SRCS += pci.c
 SRCS += win32.c
+SRCS += term.c
 # OSD
 SRCS += osd/microui.c osd/osd.c
 
 OBJS = ${SRCS:.c=.o}
 
-.PHONY: all clean dep prepare
+-include config.mk
+
+.PHONY: all clean dep prepare show
 .SUFFIXES: .c
 .c.o:
 	@/bin/echo -e " \e[1;32mCC\e[0m\t\e[1;37m$<\e[0m \e[1;32m->\e[0m \e[1;37m$@\e[0m"
 	${Q}${CC} ${CFLAGS} -c $< -o $@
 
-all: ${PROGS}
+all: show ${PROGS}
+
+# the CPU's object (i386.o, or fast/fast.o built for y or pd) is rebuilt when USE_FAST changes, and the programs relinked
+i386.o fast/fast.o: .fast-${USE_FAST}
+.fast-${USE_FAST}:
+	@rm -f .fast-*
+	@touch $@
 
 win32:
 	make -C . PLAT=win32
 
 clean:
-	rm -f ${OBJS} .depends ${PROGS}
+	rm -f ${OBJS} i386.o fast/fast.o .fast-* amd64.o fpu.o amd64-comb.o i386-comb.o fpu-leg32.o i386-leg32.o .depends ${PROGS}
 
-prepare: fmopl.inc
+show:
+	@echo CC = ${CC}
+	@echo USE_FAST = ${USE_FAST}
+	@echo USE_AMD64 = ${USE_AMD64}
+	@echo USE_CPUABS = ${USE_CPUABS}
+	@echo USE_SDL = ${USE_SDL}
+	@echo USE_SLIRP = ${USE_SLIRP}
+	@echo SLIRP_INC = ${SLIRP_INC}
+	@echo SLIRP_LIB = ${SLIRP_LIB}
+	@echo USE_TUNTAP = ${USE_TUNTAP}
+	@echo USE_FMOPL = ${USE_FMOPL}
+	@echo USE_GLIBC_FIX = ${USE_GLIBC_FIX}
+	@echo ENABLE_CISO = ${ENABLE_CISO}
+	@echo ENABLE_RAWDRAW_WAYLAND = ${ENABLE_RAWDRAW_WAYLAND}
+
+prepare: fmopl.inc ${PREPARE_WAYLAND}
+
+prepare_wayland:
+	make -C rawdraw/wayland
 
 fmopl.inc: fmopl.c
 	${HOSTCC} -DGENTABLE $^$> -o fmoplgen -lm && ./fmoplgen > $@ && rm -f ./fmoplgen
+
+fpu-leg32.o: fpu.c
+	@/bin/echo -e " \e[1;32mCC\e[0m\t\e[1;37m$<\e[0m \e[1;32m->\e[0m \e[1;37m$@\e[0m"
+	${Q}${CC} ${CFLAGS} -UUSE_AMD64 -c $< -o $@
+
+i386-leg32.o: i386.c
+	@/bin/echo -e " \e[1;32mCC\e[0m\t\e[1;37m$<\e[0m \e[1;32m->\e[0m \e[1;37m$@\e[0m"
+	${Q}${CC} ${CFLAGS} -UUSE_AMD64 -c $< -o $@
+
+i386-comb.o: i386-leg32.o fpu-leg32.o
+	@/bin/echo -e " \e[1;32mLD\e[0m\t\e[1;37m$^$>\e[0m \e[1;32m->\e[0m \e[1;37m$@\e[0m"
+	${Q}${LD} -r -o $@ $^$>
+	${Q}${OBJCOPY} --localize-hidden --keep-global-symbols=i386_syms.txt $@
+
+amd64-comb.o: amd64.o fpu.o
+	@/bin/echo -e " \e[1;32mLD\e[0m\t\e[1;37m$^$>\e[0m \e[1;32m->\e[0m \e[1;37m$@\e[0m"
+	${Q}${LD} -r -o $@ $^$>
+	${Q}${OBJCOPY} --localize-hidden --keep-global-symbols=amd64_syms.txt $@
 
 tiny386${SUFF_SDL}: sdl/main.c ${OBJS}
 	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
@@ -149,7 +223,7 @@ wifikbd${SUFF_SDL}: tools/wifikbd.c win32.c ${SRCS_GLIBC_FIX}
 	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
 	${Q}${CC} ${LDFLAGS} ${CFLAGS_SDL} -o $@ $^$> ${LIBS_SDL}
 
-wifikbd${SUFF_RAWDRAW}: rawdraw/wifikbd.c win32.c ${SRCS_GLIBC_FIX}
+wifikbd${SUFF_RAWDRAW}: rawdraw/wifikbd.c win32.c vgafont.o ${SRCS_GLIBC_FIX}
 	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
 	${Q}${CC} ${LDFLAGS} ${CFLAGS} -o $@ $^$> ${LIBS_RAWDRAW}
 

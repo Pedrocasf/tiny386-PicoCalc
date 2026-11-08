@@ -360,6 +360,7 @@ int main(int argc, char *argv[])
 		if (strcmp(argv[1], "-kvm") == 0)
 			enable_kvm = true;
 		argv1 = argv[2];
+		ne2000_set_config_file(argv1);
 	} else {
 		return 1;
 	}

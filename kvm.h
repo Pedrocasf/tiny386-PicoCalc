@@ -1,7 +1,11 @@
 #ifndef KVM_H
 #define KVM_H
 
+#ifndef USE_AMD64
 #include "i386.h"
+#else
+#include "amd64.h"
+#endif
 typedef struct CPUKVM CPUKVM;
 
 CPUKVM *cpukvm_new(char *phys_mem, long phys_mem_size, CPU_CB **cb);

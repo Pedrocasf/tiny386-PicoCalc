@@ -32,12 +32,8 @@
 //#include "pc.h"
 //#include "net.h"
 
-#ifndef BUILD_ESP32
 #if defined(_WIN32)
 #include <winsock2.h>
-#endif
-#else
-#include "esp_mac.h"
 #endif
 
 #ifdef BUILD_ESP32
@@ -184,6 +180,14 @@ struct VC {
     void (*send_packet)(void *vc, uint8_t *buf, int size);
     void (*step)(NE2000State *s);
 };
+
+static char *config_file;
+void ne2000_set_config_file(const char *file)
+{
+    if (config_file)
+        free(config_file);
+    config_file = strdup(file);
+}
 
 static void ne2000_reset(NE2000State *s)
 {
@@ -424,8 +428,10 @@ static void *net_open_tuntap(NE2000State *s)
 #endif
 
 #if defined(USE_SLIRP)
-#include <slirp/libslirp.h>
+#include "slirp/libslirp.h"
 #include <stdio.h>
+#include "ini.h"
+
 struct SLIRP {
     VC header;
     void *slirp;
@@ -563,6 +569,157 @@ static void ne2000_step_slirp(NE2000State *ne2000)
     slirp_pollfds_poll(s->slirp, ret < 0, get_revents_cb, s);
 }
 
+static int parse1(void* user, const char* section,
+                  const char* name, const char* value)
+{
+	SlirpConfig *cfg = user;
+#define SEC(a) (strcmp(section, a) == 0)
+#define NAME(a) (strcmp(name, a) == 0)
+	if (SEC("slirp")) {
+        }
+#undef SEC
+#undef NAME
+	return 1;
+}
+
+static int parse_single_addr(const char *addr_str,
+                             struct sockaddr *out_addr,
+                             socklen_t *out_len,
+                             int *is_udp)
+{
+    char proto[16] = {0};
+    char ip[64] = {0};
+    int port = -1;
+
+    if (sscanf(addr_str, "%15[^:]:%63[^:]:%d", proto, ip, &port) != 3)
+        if (sscanf(addr_str, "%15[^:]::%d", proto, &port) != 2)
+            return -1;
+
+    if (strcmp(proto, "tcp") == 0) {
+        *is_udp = 0;
+    } else if (strcmp(proto, "udp") == 0) {
+        *is_udp = 1;
+    } else {
+        return -1;
+    }
+
+    if (port < 0 || port > 65535) {
+        return -1;
+    }
+
+    struct sockaddr_in in_addr;
+    memset(&in_addr, 0, sizeof(struct sockaddr_in));
+    in_addr.sin_family = AF_INET;
+    in_addr.sin_port = htons(port);
+    if (ip[0] && inet_pton(AF_INET, ip, &(in_addr.sin_addr)) <= 0) {
+        return -1;
+    }
+
+    memcpy(out_addr, &in_addr, sizeof(struct sockaddr_in));
+    *out_len = sizeof(struct sockaddr_in);
+
+    return 0;
+}
+
+static int parse_net_pair(const char *input_str,
+                          struct sockaddr *addr1, socklen_t *addr1len, int *is_udp1,
+                          struct sockaddr *addr2, socklen_t *addr2len, int *is_udp2)
+{
+    char buf[256];
+    if (strlen(input_str) >= sizeof(buf)) {
+        return -1;
+    }
+    strcpy(buf, input_str);
+
+    char *dash = strchr(buf, '-');
+    if (!dash) {
+        return -1;
+    }
+    *dash = '\0';
+
+    int ret;
+
+    ret = parse_single_addr(buf, addr1, addr1len, is_udp1);
+    if (ret != 0) return ret;
+
+    ret = parse_single_addr(dash + 1, addr2, addr2len, is_udp2);
+    if (ret != 0) return ret;
+
+    return 0;
+}
+
+static int parse2(void* user, const char* section,
+                  const char* name, const char* value)
+{
+	Slirp *slirp = user;
+        struct sockaddr_storage addr1, addr2;
+        socklen_t addr1len, addr2len;
+        int is_udp1, is_udp2;
+#define SEC(a) (strcmp(section, a) == 0)
+#define NAME(a) (strcmp(name, a) == 0)
+#define NAMEPFX(a) (strncmp(name, a, strlen(a)) == 0)
+	if (SEC("slirp")) {
+            if (NAMEPFX("guestfwd")) {
+                if (parse_net_pair(value,
+                                   (struct sockaddr *) &addr1, &addr1len, &is_udp1,
+                                   (struct sockaddr *) &addr2, &addr2len, &is_udp2))
+                    fprintf(stderr, "slirp: bad guestfwd %s\n", value);
+                else if (is_udp1 || is_udp2)
+                    fprintf(stderr, "slirp: bad guestfwd %s\n", value);
+                else {
+#ifdef SLIRP_EXTENSION
+                    struct sockaddr_in *in1 = (struct sockaddr_in *) &addr1;
+                    struct sockaddr_in *in2 = (struct sockaddr_in *) &addr2;
+                    slirp_add_tcp(slirp, *in2, &(in1->sin_addr), ntohs(in1->sin_port));
+#else
+                    fprintf(stderr, "slirp: unsupported guestfwd %s\n", value);
+#endif
+                }
+            } else if (NAMEPFX("hostfwd")) {
+                if (parse_net_pair(value,
+                                   (struct sockaddr *) &addr1, &addr1len, &is_udp1,
+                                   (struct sockaddr *) &addr2, &addr2len, &is_udp2))
+                    fprintf(stderr, "slirp: bad hostfwd %s\n", value);
+                else if (is_udp1 ^ is_udp2)
+                    fprintf(stderr, "slirp: bad hostfwd %s\n", value);
+                else {
+                    struct sockaddr *a1 = (struct sockaddr *) &addr1;
+                    struct sockaddr *a2 = (struct sockaddr *) &addr2;
+                    slirp_add_hostxfwd(slirp, a1, addr1len, a2, addr2len,
+                                       is_udp1 ? SLIRP_HOSTFWD_UDP : 0);
+                }
+            }
+        }
+#undef SEC
+#undef NAME
+#undef NAMEPFX
+	return 1;
+}
+
+static Slirp *my_slirp_new(SlirpConfig *cfg,
+                          const SlirpCb *callbacks,
+                          void *opaque)
+{
+    Slirp *slirp = NULL;
+    const char *file = config_file;
+    if (file) {
+        int err = ini_parse(file, parse1, cfg);
+        if (err) {
+		fprintf(stderr, "ne2000: ini_parse error %d\n", err);
+	}
+    }
+
+    slirp = slirp_new(cfg, callbacks, opaque);
+
+    if (slirp && file) {
+        int err = ini_parse(file, parse2, slirp);
+        if (err) {
+		fprintf(stderr, "ne2000: ini_parse error %d\n", err);
+	}
+    }
+    return slirp;
+}
+
 static void *net_open_slirp(NE2000State *s)
 {
     struct in_addr net_addr  = { .s_addr = htonl(0x0a000200) }; /* 10.0.2.0 */
@@ -589,7 +746,7 @@ static void *net_open_slirp(NE2000State *s)
     cfg.vnameserver = dns;
 
     struct SLIRP *slirp = malloc(sizeof(struct SLIRP));
-    slirp->slirp = slirp_new(&cfg, &cb, slirp);
+    slirp->slirp = my_slirp_new(&cfg, &cb, slirp);
     slirp->ne2000 = s;
     slirp->nextts = get_uticks();
     slirp->header.send_packet = qemu_send_packet_slirp;
@@ -1063,6 +1220,22 @@ int wlanif_l2_input_hook(uint8_t *buf, int size)
     }
     return 0;
 }
+
+#ifdef USE_HOSTED_WIFI
+#include "esp_wifi_remote.h"
+#include "esp_wifi_remote_api.h"
+static void my_esp_get_mac(uint8_t *mac)
+{
+    esp_wifi_remote_get_mac(WIFI_IF_STA, mac);
+}
+#else
+#include "esp_mac.h"
+static void my_esp_get_mac(uint8_t *mac)
+{
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+}
+#endif
+
 #endif
 
 NE2000State *isa_ne2000_init(int base, int irq,
@@ -1096,7 +1269,7 @@ NE2000State *isa_ne2000_init(int base, int irq,
     const static uint8_t macaddr[6] = {0x52, 0x54, 0x00, 0x78, 0x9a, 0xbc};
     memcpy(s->macaddr, macaddr, 6);
 #else
-    esp_read_mac(s->macaddr, ESP_MAC_WIFI_STA);
+    my_esp_get_mac(s->macaddr);
     thene2000 = s;
 #endif
 

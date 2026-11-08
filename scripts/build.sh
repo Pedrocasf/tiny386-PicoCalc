@@ -30,7 +30,7 @@ build_sdl() {
 build_slirp() {
     cp -r ../scripts/slirp . &&
 	cd slirp &&
-	git clone -b v4.9.1 --depth=1 https://gitlab.freedesktop.org/slirp/libslirp.git slirp &&
+	git clone -b v4.9.5 --depth=1 https://gitlab.freedesktop.org/slirp/libslirp.git slirp &&
 	cd slirp && patch -p1 < ../patch && cd .. &&
 	make && make install DESTDIR=build && make clean &&
 	make win32 && make install DESTDIR=build-mingw32 && make clean &&
@@ -43,7 +43,7 @@ build_thirdparty() {
 	build_seabios &&
 	build_slirp &&
     cd .. &&
-    make prepare
+    make prepare ENABLE_RAWDRAW_WAYLAND=y
 }
 
 build_tiny386() {
@@ -52,6 +52,7 @@ build_tiny386() {
 	make \
 	     USE_GLIBC_FIX=y \
 	     USE_CPUABS=y \
+	     ENABLE_RAWDRAW_WAYLAND=y \
 	     SLIRP_INC="-I$PWD/build/slirp/build" \
 	     SLIRP_LIB="-L$PWD/build/slirp/build -lslirp" clean all &&
 	strip -s tiny386 wifikbd initnet &&

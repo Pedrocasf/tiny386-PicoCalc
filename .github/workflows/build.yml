@@ -16,6 +16,7 @@ jobs:
       run: |
         sudo apt-get update -qq
         sudo apt-get install -qq git build-essential clang mingw-w64 libasound2-dev libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxv-dev --no-install-recommends
+        sudo apt-get install -qq pkg-config libwayland-dev wayland-protocols --no-install-recommends
 
     - name: prepare
       run: scripts/build.sh thirdparty
@@ -33,9 +34,20 @@ jobs:
     - name: esp-idf esp32p4 build
       uses: espressif/esp-idf-ci-action@v1
       with:
-        esp_idf_version: v6.0.2
+        esp_idf_version: v6.0.3
         target: esp32p4
         command: scripts/build.sh patch_idf_60 && scripts/build.sh esp_p4
+
+    - name: android setup keystore
+      env:
+        SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+      run: |
+        python3 -c "import os, base64; key = os.environ.get('SIGNING_KEY', ''); open('android/my-release-key.keystore', 'wb').write(base64.b64decode(key)) if key else 0"
+
+    - name: android build
+      run: |
+        cd android && make android-30.jar && make prepare && make && cd ..
+        mkdir -p out/android && cp android/tiny386.apk out/android
 
     - name: release
       env:

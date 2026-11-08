@@ -49,6 +49,16 @@ static CPUABS *cpu_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 		cpu->enable_fpu = NULL;
 		cpu->_raise_irq = raise_irq_kvm;
 	} else {
+#if defined(USE_AMD64)
+		cpu->cpu = cpuamd64_new(gen, phys_mem, phys_mem_size, cb);
+		cpu->reset = (void *) cpuamd64_reset;
+		cpu->reset_pm = (void *) cpuamd64_reset_pm;
+		cpu->set_gpr = (void *) cpuamd64_set_gpr;
+		cpu->step = (void *) cpuamd64_step;
+		cpu->register_mem = NULL;
+		cpu->enable_fpu = NULL;
+		cpu->_raise_irq = raise_irq_amd64;
+#else
 		cpu->cpu = cpui386_new(gen, phys_mem, phys_mem_size, cb);
 		cpu->reset = (void *) cpui386_reset;
 		cpu->reset_pm = (void *) cpui386_reset_pm;
@@ -57,6 +67,7 @@ static CPUABS *cpu_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 		cpu->register_mem = NULL;
 		cpu->enable_fpu = (void *) cpui386_enable_fpu;
 		cpu->_raise_irq = raise_irq_i386;
+#endif
 	}
 	return cpu;
 }
@@ -128,7 +139,11 @@ static void cpu_enable_fpu(CPUABS *cpu)
 void pcmalloc_init(void *ptr, long len);
 #else
 #define MIXER_BUF_LEN 2048
+#ifdef ANDROID
+#define PC_STEP_COUNT 4096
+#else
 #define PC_STEP_COUNT 10240
+#endif
 #define pcmalloc_init(ptr, len)
 #endif
 
@@ -179,6 +194,7 @@ static u8 pc_io_read(void *o, int addr)
 	case 0x376:
 		val = ide_status_read(pc->ide2);
 		return val;
+	case 0x3b4: case 0x3b5: case 0x3ba:	/* the CRTC and status, monochrome */
 	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
 	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
 	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
@@ -378,6 +394,7 @@ static void pc_io_write(void *o, int addr, u8 val)
 	case 0x376:
 		ide_cmd_write(pc->ide2, val);
 		return;
+	case 0x3b4: case 0x3b5: case 0x3ba:	/* the CRTC and status, monochrome */
 	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
 	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
 	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
@@ -393,7 +410,9 @@ static void pc_io_write(void *o, int addr, u8 val)
 		fflush(stdout);
 		return;
 	case 0x92:
-		pc->port92 = val;
+		if (val & 1)
+			pc->reset_request = 1;
+		pc->port92 = val & ~1;
 		return;
 	case 0x60:
 		kbd_write_data(pc->i8042, addr, val);
@@ -493,6 +512,7 @@ static void pc_io_write16(void *o, int addr, u16 val)
 	case 0x170:
 		ide_data_writew(pc->ide2, val);
 		return;
+	case 0x3b4:	/* the CRTC, monochrome: index and data at once */
 	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
 	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
 	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
@@ -687,6 +707,20 @@ static void iomem_write32(void *iomem, uword addr, u32 val)
 	vga_mem_write32(pc->vga, addr - 0xa0000, val);
 }
 
+#if defined(USE_AMD64)
+static u64 iomem_read64(void *iomem, uword addr)
+{
+	return iomem_read32(iomem, addr) |
+		((u64) iomem_read32(iomem, addr + 4) << 32);
+}
+
+static void iomem_write64(void *iomem, uword addr, u64 val)
+{
+	iomem_write32(iomem, addr, val);
+	iomem_write32(iomem, addr + 4, val >> 32);
+}
+#endif
+
 static bool iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
 {
 	PC *pc = iomem;
@@ -717,13 +751,19 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	char *mem = bigmalloc(conf->mem_size);
 	CPU_CB *cb = NULL;
 	memset(mem, 0, conf->mem_size);
-	pcmalloc_init(mem + 0xa0000, 0xc0000 - 0xa0000);
+	// guest writes below 0xa0000 may overwrite 0xa0000
+	pcmalloc_init(mem + 0xa0020, 0xc0000 - 0xa0020);
 	pc->cpu = cpu_new(conf->cpu_gen, mem, conf->mem_size, &cb);
 	if (conf->fpu)
 		cpu_enable_fpu(pc->cpu);
 #if defined(USE_AMD64)
 	if (conf->cpuid_vendor) {
+#if defined(USE_CPUABS)
+		if (conf->cpu_gen >= 0)
+			cpuamd64_set_vendor(pc->cpu->cpu, conf->cpuid_vendor);
+#else
 		cpuamd64_set_vendor(pc->cpu, conf->cpuid_vendor);
+#endif
 	}
 #endif
 	pc->bios = conf->bios;
@@ -824,6 +864,10 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	cb->iomem_read32 = iomem_read32;
 	cb->iomem_write32 = iomem_write32;
 	cb->iomem_write_string = iomem_write_string;
+#if defined(USE_AMD64)
+	cb->iomem_read64 = iomem_read64;
+	cb->iomem_write64 = iomem_write64;
+#endif
 
 	pc->redraw = redraw;
 	pc->redraw_data = redraw_data;
@@ -849,17 +893,27 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 
 void mixer_callback (void *opaque, uint8_t *stream, int free)
 {
-	uint8_t tmpbuf[MIXER_BUF_LEN];
 	PC *pc = opaque;
 	assert(free / 2 <= MIXER_BUF_LEN);
+#ifdef USE_NUKED_OPL3
+	uint8_t tmpbuf[MIXER_BUF_LEN * 2];
+	memset(tmpbuf, 0, MIXER_BUF_LEN * 2);
+	adlib_callback(pc->adlib, tmpbuf, free); // s16, stereo
+#else
+	uint8_t tmpbuf[MIXER_BUF_LEN];
 	memset(tmpbuf, 0, MIXER_BUF_LEN);
 	adlib_callback(pc->adlib, tmpbuf, free / 2); // s16, mono
+#endif
 	sb16_audio_callback(pc->sb16, stream, free); // s16, stereo
 
 	int16_t *d2 = (int16_t *) stream;
 	int16_t *d1 = (int16_t *) tmpbuf;
 	for (int i = 0; i < free / 2; i++) {
+#ifdef USE_NUKED_OPL3
+		int res = d2[i] + d1[i] * 2;
+#else
 		int res = d2[i] + d1[i / 2];
+#endif
 		if (res > 32767) res = 32767;
 		if (res < -32768) res = -32768;
 		d2[i] = res;
