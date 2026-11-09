@@ -1008,11 +1008,12 @@ static void vga_text_refresh(VGAState *s,
         dw = 2;
     width1 = width * cwidth * dw;
     height1 = disp;
-    if (fb_dev->width < width1 || fb_dev->height < height1 ||
-        width > MAX_TEXT_WIDTH || height > MAX_TEXT_HEIGHT)
+    if (width > MAX_TEXT_WIDTH || height > MAX_TEXT_HEIGHT)
         return; /* not enough space */
-    x1 = (fb_dev->width - width1) / 2;
-    y1 = (fb_dev->height - height1) / 2;
+    /* centred where it fits; where it does not, its top left corner, cut
+       at the edge of the screen, as the graphics modes are */
+    x1 = fb_dev->width > width1 ? (fb_dev->width - width1) / 2 : 0;
+    y1 = fb_dev->height > height1 ? (fb_dev->height - height1) / 2 : 0;
     int stride = fb_dev->stride;
     if (x1 != s->last_text_x1 || y1 != s->last_text_y1 ||
         width1 != s->last_text_w1 || height1 != s->last_text_h1) {
@@ -1104,6 +1105,11 @@ static void vga_text_refresh(VGAState *s,
             first = -top;
         if (disp - top < cheight)
             last = disp - top;
+        /* cut at the bottom of the screen */
+        if (y1 + top + last > fb_dev->height)
+            last = fb_dev->height - y1 - top;
+        if (last <= first)
+            break;  /* this row and those below it are off the screen */
         dst = fb_dev->fb_data + (y1 + top + first) * stride + x1 * (BPP / 8);
 #endif
         cx_min = width;
@@ -1112,6 +1118,10 @@ static void vga_text_refresh(VGAState *s,
         for(cx = 0; cx < cxend - cxbegin; cx++) {
 #else
         for(cx = 0; cx < width; cx++) {
+            /* the dots of this cell that are on the screen */
+            int vis = fb_dev->width - (x1 + cx * cwidth * dw);
+            if (vis <= 0)
+                break;  /* this cell and those right of it are off it */
 #endif
             ch_attr = *(uint16_t *)(vga_ram + (ch_addr & 0x1fffe));
 #ifdef FULL_UPDATE
@@ -1138,13 +1148,26 @@ static void vga_text_refresh(VGAState *s,
                 dup9 = 0;
                 if (cwidth == 9 && ch >= 0xc0 && ch <= 0xdf && (s->ar[0x10] & 0x04))
                     dup9 = 1;
-                vga_draw_cell(dst, stride, font_ptr + 4 * first, last - first,
+                /* where the cell is drawn: on the screen, or, for a cell
+                   cut by its right edge, a buffer of its own, from which
+                   what is on the screen is copied */
+                uint8_t *cd = dst;
+                int cs = stride;
+#if !(defined(SCALE_3_2) || defined(SCALE_2_1) || defined(SWAPXY))
+                uint8_t cellbuf[9 * 2 * 32 * (BPP / 8)];
+                int cut = vis < cwidth * dw;
+                if (cut) {
+                    cd = cellbuf;
+                    cs = cwidth * dw * (BPP / 8);
+                }
+#endif
+                vga_draw_cell(cd, cs, font_ptr + 4 * first, last - first,
                               fgcol, bgcol, cwidth, dup9, dw);
                 /* the underline: a foreground of 1 on a background of 0,
                    at the line CR14h says (beyond the cell in colour modes) */
                 int ul = s->cr[0x14] & 0x1f;
                 if ((cattr & 0x77) == 0x01 && ul >= first && ul < last)
-                    vga_draw_cell(dst + stride * (ul - first), stride,
+                    vga_draw_cell(cd + cs * (ul - first), cs,
                                   cursor_glyph, 1, fgcol, bgcol, cwidth, 1, dw);
                 /* cursor display */
                 if (cursor_offset == ch_addr && !(cursor_start & 0x20) && s->cursor_visible_phase) {
@@ -1162,11 +1185,17 @@ static void vga_text_refresh(VGAState *s,
 
                     if (line_last >= line_start) {
                         h = line_last - line_start + 1;
-                        dst1 = dst + stride * (line_start - first);
-                        vga_draw_cell(dst1, stride, cursor_glyph, h,
+                        dst1 = cd + cs * (line_start - first);
+                        vga_draw_cell(dst1, cs, cursor_glyph, h,
                                       textcol, bgcol, cwidth, 1, dw);
                     }
                 }
+#if !(defined(SCALE_3_2) || defined(SCALE_2_1) || defined(SWAPXY))
+                if (cut)
+                    for (int l = 0; l < last - first; l++)
+                        memcpy(dst + l * stride, cellbuf + l * cs,
+                               vis * (BPP / 8));
+#endif
             }
             ch_addr += 4;
             dst += (BPP / 8) * cwidth * dw;
