@@ -73,6 +73,13 @@ struct CPUI386 {
 		uword base;
 		u8 *host;
 		bool filled;
+#ifdef USE_FASTMEM
+		/* where writes go: `host` again with paging off; with paging
+		 * on, `host` and `whost` are the fastmem read and write windows
+		 * and every access probes the host MMU first (see fm_probe) */
+		u8 *whost;
+		bool probe;
+#endif
 	} segfast[8];
 
 	struct {
@@ -610,11 +617,32 @@ static void segfast_invalidate(CPUI386 *cpu)
 		segfast_invalidate1(cpu, i);
 }
 
+#ifdef USE_FASTMEM
+static void fm_flush(CPUI386 *cpu);
+static void fm_invlpg(CPUI386 *cpu, uword laddr);
+#endif
+
+/* the only writer of cpu->cpl after reset: under fastmem the user and the
+ * supervisor see guest memory through different windows, and the segment
+ * fast path caches which one */
+static inline void set_cpl(CPUI386 *cpu, int cpl)
+{
+#ifdef USE_FASTMEM
+	if ((cpl == 3) != (cpu->cpl == 3))
+		segfast_invalidate(cpu);
+#endif
+	cpu->cpl = cpl;
+}
+
 static void tlb_clear(CPUI386 *cpu)
 {
 	/* every reason to drop the tlb -- a cr3 write, a paging or protection
 	 * change, a reset -- is also a reason to drop the segment fast path */
 	segfast_invalidate(cpu);
+#ifdef USE_FASTMEM
+	/* and the fastmem windows, which are a TLB the host MMU keeps */
+	fm_flush(cpu);
+#endif
 	tlb_gen++;
 	for (int i = 0; i < tlb_size; i++) {
 		cpu->tlb.tab[i].lpgno = -1;
@@ -622,6 +650,22 @@ static void tlb_clear(CPUI386 *cpu)
 	cpu->ifetch.laddr = -1;
 	cpu->ifetch.paddr = 0;
 }
+
+#ifdef USE_FASTMEM
+/* invlpg: tiny386's own TLB is cheap to drop whole, as before, but the
+ * windows cost a page fault per page to fill again, so they lose one page */
+static void tlb_invlpg(CPUI386 *cpu, uword laddr)
+{
+	segfast_invalidate(cpu);
+	fm_invlpg(cpu, laddr);
+	tlb_gen++;
+	for (int i = 0; i < tlb_size; i++) {
+		cpu->tlb.tab[i].lpgno = -1;
+	}
+	cpu->ifetch.laddr = -1;
+	cpu->ifetch.paddr = 0;
+}
+#endif
 
 static int pte_lookup[2][4][2][2] = { //[wp != 0][(pte >> 1) & 3][cpl == 3][rwm > 1]
 	{ // wp == 0
@@ -822,6 +866,462 @@ static inline bool in_iomem(uword addr)
 	return (addr >= 0xa0000 && addr < 0xc0000) || addr >= 0xe0000000;
 }
 
+#ifdef USE_FASTMEM
+/*
+ * Fastmem: the host MMU translates guest linear addresses (Linux/x86-64 hosts
+ * only, `make USE_FASTMEM=y`).
+ *
+ * Guest RAM lives in a memfd, and phys_mem is remapped onto it, so the rest of
+ * the emulator keeps its pointer.  Four 4 GiB windows of host address space
+ * stand for the guest's linear address space: for each of the supervisor
+ * (CPL 0-2) and the user (CPL 3), a read window and a write window.  A guest
+ * page is mapped into a read window (read-only) only after the ordinary slow
+ * path -- translate() and its TLB -- has read it at that CPL and found plain
+ * RAM behind it, and into a write window (read-write) only after the slow
+ * path has written it.  So a mapping means "the slow path would let this
+ * through, and has already set the A bit (and the D bit for a write)";
+ * protection is never worked out twice.  MMIO, not-present pages and anything
+ * beyond RAM are never mapped.
+ *
+ * With paging on, a segment's fast path (struct segfast) points into the
+ * windows for the current CPL, and each access first probes its first and
+ * last byte with a load from the window it will use -- a load even for a
+ * store, since a page is in the write window only if writing it is allowed.
+ * If the probe faults, the SIGSEGV handler finds it in the fm_extable
+ * section, makes it return false, and the access goes down the slow path,
+ * which raises the guest #PF there and then, with the CR2 and error code it
+ * always had, before the instruction has changed anything.  Probing at
+ * translate time rather than faulting at the real load/store is what keeps
+ * faults precise: an instruction translates its operands before it writes.
+ *
+ * The windows are a TLB, flushed wherever tiny386's own TLB is (tlb_clear:
+ * CR0/CR3 writes, invlpg, task switches, reset).  A CPL change switches
+ * windows instead.  Paging off needs none of this: segfast already points
+ * straight into phys_mem then.
+ */
+#if !defined(__linux__) || !defined(__x86_64__)
+#error "USE_FASTMEM needs a Linux x86-64 host"
+#endif
+#include <errno.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <sys/mman.h>
+
+#define FM_WIN_SIZE (1ul << 32)
+#define FM_WIN_STRIDE (FM_WIN_SIZE + (1ul << 16))	/* a guard between windows */
+#define FM_NWIN 4
+/* window index: CPL 3 or not, and read or write */
+#define FM_WIN(user, write) (((user) ? 1 : 0) | ((write) ? 2 : 0))
+/* mmap()s per window between flushes; each may be a VMA of its own, and
+ * vm.max_map_count is typically 65530 */
+#define FM_MAX_MAPS 12288
+
+struct fm_extable_entry {
+	uintptr_t insn, fixup;
+};
+extern struct fm_extable_entry __start_fm_extable[], __stop_fm_extable[];
+
+static struct {
+	bool enabled;
+	CPUI386 *cpu;
+	int fd;
+	u8 *resv;
+	u8 *win[FM_NWIN];
+	long nmaps[FM_NWIN];
+	struct sigaction old_segv;
+	unsigned long misses, maps, flushes, invlpgs, rescues, pauses;
+	/* the governor, see fm_tick */
+	bool paused, always;
+	unsigned long tick_misses;
+	long tick_cycle, next_tick;
+} fm;
+
+/* load the byte at p; false if the host MMU says no */
+static inline bool fm_probe(const u8 *p)
+{
+	asm goto("1: cmpb $0, (%0)\n\t"
+		 ".pushsection fm_extable, \"aw\"\n\t"
+		 ".balign 8\n\t"
+		 ".quad 1b, %l[fault]\n\t"
+		 ".popsection"
+		 : : "r" (p) : "cc" : fault);
+	return true;
+fault:
+	return false;
+}
+
+static inline bool fm_active(CPUI386 *cpu)
+{
+	return fm.enabled && fm.cpu == cpu && !fm.paused && !GET_LM_EFER(cpu);
+}
+
+/*
+ * A refill costs a host page fault, a signal and an mmap: a few
+ * microseconds, or the time to interpret thousands of instructions.  Phases
+ * that keep changing page tables -- booting, forking, patching kernel text --
+ * refill more than the fast accesses win back, so watch the rate and step
+ * aside (plain TLB path, no probes) for a while when it is too high.  The
+ * windows are still flushed while paused, so they stay correct.
+ */
+#define FM_PERIOD (1L << 21)		/* instructions per sample */
+#define FM_MISS_COST 4000		/* a refill, in instructions */
+#define FM_PAUSE (8 * FM_PERIOD)
+static void fm_tick(CPUI386 *cpu)
+{
+	if (!fm.enabled || fm.cpu != cpu || fm.always || cpu->cycle < fm.next_tick)
+		return;
+	if (fm.paused) {
+		fm.paused = false;
+		segfast_invalidate(cpu);
+	} else if ((long) (fm.misses - fm.tick_misses) * FM_MISS_COST >
+		   cpu->cycle - fm.tick_cycle) {
+		fm.paused = true;
+		fm.pauses++;
+		segfast_invalidate(cpu);
+	}
+	fm.tick_misses = fm.misses;
+	fm.tick_cycle = cpu->cycle;
+	fm.next_tick = cpu->cycle + (fm.paused ? FM_PAUSE : FM_PERIOD);
+}
+
+static void fm_flush(CPUI386 *cpu)
+{
+	if (!fm.enabled || fm.cpu != cpu)
+		return;
+	for (int k = 0; k < FM_NWIN; k++) {
+		if (!fm.nmaps[k])
+			continue;
+		/* one call drops every mapping in the window */
+		if (mmap(fm.win[k], FM_WIN_SIZE, PROT_NONE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
+			 -1, 0) == MAP_FAILED) {
+			dolog("fastmem: flush failed: %s\n", strerror(errno));
+			abort();
+		}
+		fm.nmaps[k] = 0;
+	}
+	fm.flushes++;
+}
+
+/* drop one linear page from every window, for invlpg */
+static void fm_invlpg(CPUI386 *cpu, uword laddr)
+{
+	if (!fm.enabled || fm.cpu != cpu)
+		return;
+	fm.invlpgs++;
+	for (int k = 0; k < FM_NWIN; k++) {
+		if (!fm.nmaps[k])
+			continue;
+		if (mmap(fm.win[k] + (laddr & ~(uword) 0xfff), 4096, PROT_NONE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
+			 -1, 0) == MAP_FAILED) {
+			dolog("fastmem: invlpg failed: %s\n", strerror(errno));
+			abort();
+		}
+	}
+}
+
+/* map linear page lpgno of window k onto physical page ppgno */
+static void fm_map1(int k, uword lpgno, uword ppgno, int prot)
+{
+	if (fm.nmaps[k] >= FM_MAX_MAPS)
+		return;		/* full until the next flush: slow path till then */
+	if (mmap(fm.win[k] + ((uintptr_t) lpgno << 12), 4096, prot,
+		 MAP_SHARED | MAP_FIXED, fm.fd, (off_t) ppgno << 12) == MAP_FAILED) {
+		fm.nmaps[k] = FM_MAX_MAPS;
+		return;
+	}
+	fm.nmaps[k]++;
+	fm.maps++;
+}
+
+/* a write the slow path allowed implies a read it would allow too */
+static void fm_map(bool user, bool write, uword lpgno, uword ppgno)
+{
+	fm_map1(FM_WIN(user, false), lpgno, ppgno, PROT_READ);
+	if (write)
+		fm_map1(FM_WIN(user, true), lpgno, ppgno, PROT_READ | PROT_WRITE);
+}
+
+static inline bool fm_is_ram(CPUI386 *cpu, uword paddr)
+{
+	return paddr < cpu->phys_mem_size && !in_iomem(paddr);
+}
+
+/*
+ * How many pages from lpgno on, in the same page table, a fill can map with
+ * one mmap: present, allowed for this kind of access at this CPL (by the very
+ * table the TLB uses), plain RAM, physically contiguous from ppgno, and for a
+ * write already dirty.  Each one gets its accessed bit, as a CPU may set it
+ * for a translation it caches ahead of use; dirty bits are left to the slow
+ * path.  0 if lpgno itself does not qualify.  The kernel's direct map of
+ * RAM is one long such run, so after a flush it comes back FM_RUN pages per
+ * fault instead of one.
+ */
+#ifndef FM_RUN
+/* 1: on a Linux boot, 16 cut the refills by a third but not the time, as
+ * every page mapped costs a host minor fault of its own when first touched */
+#define FM_RUN 1
+#endif
+static int fm_run(CPUI386 *cpu, uword lpgno, uword ppgno, bool user, bool write)
+{
+	uword pdeaddr = (cpu->cr3 & ~0xfff) + (lpgno >> 10) * 4;
+	if (pdeaddr + 4 > cpu->phys_mem_size)
+		return 0;
+	uword pde = pload32(cpu, pdeaddr);
+	if (!(pde & 1) || !(pde & 0x20))
+		return 0;
+	uword pt = pde & ~0xfff;
+	int (*lookup)[4][2][2] = &pte_lookup[!!(cpu->cr0 & CR0_WP)];
+	int n = 0;
+	for (; n < FM_RUN && ((lpgno + n) & 1023) >= (lpgno & 1023); n++) {
+		uword pteaddr = pt + ((lpgno + n) & 1023) * 4;
+		if (pteaddr + 4 > cpu->phys_mem_size)
+			break;
+		uword pte = pload32(cpu, pteaddr);
+		uword eff = pte & ((pde & 7) | 0xfffffff8);
+		if (!(pte & 1) || (pte >> 12) != ppgno + n ||
+		    !fm_is_ram(cpu, (ppgno + n) << 12) ||
+		    (*lookup)[(eff >> 1) & 3][user][write] ||
+		    (write && !(pte & 0x40)))
+			break;
+		cpu->phys_mem[pteaddr] |= 0x20;	/* accessed */
+	}
+	return n;
+}
+
+/* map a run of pages into window k with one mmap */
+static void fm_map_run(int k, uword lpgno, uword ppgno, int n, int prot)
+{
+	if (n <= 0 || fm.nmaps[k] >= FM_MAX_MAPS)
+		return;
+	if (mmap(fm.win[k] + ((uintptr_t) lpgno << 12), (size_t) n << 12, prot,
+		 MAP_SHARED | MAP_FIXED, fm.fd, (off_t) ppgno << 12) == MAP_FAILED) {
+		fm.nmaps[k] = FM_MAX_MAPS;
+		return;
+	}
+	fm.nmaps[k]++;
+	fm.maps += n;
+}
+
+static void fm_fill_page(CPUI386 *cpu, uword lpgno, uword ppgno, bool user)
+{
+	fm_map_run(FM_WIN(user, false), lpgno, ppgno,
+		   fm_run(cpu, lpgno, ppgno, user, false), PROT_READ);
+	/* the write window too, for a write -- or for a read of a page that is
+	 * writable and already dirty, so its first store does not fault */
+	fm_map_run(FM_WIN(user, true), lpgno, ppgno,
+		   fm_run(cpu, lpgno, ppgno, user, true), PROT_READ | PROT_WRITE);
+}
+
+/* the slow path just let this access through: map its page(s) for next time */
+static __attribute__((noinline)) void fm_fill(CPUI386 *cpu, OptAddr *res,
+					       int rwm, int seg, uword addr)
+{
+	if (!fm_active(cpu))
+		return;
+	uword laddr = cpu->seg[seg].base + addr;
+	bool user = cpu->cpl == 3;
+	(void) rwm;	/* a write has set the dirty bit, which fm_run looks at */
+	if (fm_is_ram(cpu, res->addr1))
+		fm_fill_page(cpu, laddr >> 12, res->addr1 >> 12, user);
+	if (res->res == ADDR_OK2 && fm_is_ram(cpu, res->addr2))
+		fm_fill_page(cpu, (laddr >> 12) + 1, res->addr2 >> 12, user);
+}
+
+/* translate() as before, plus the fill; inline like translate() is without
+ * fastmem, since an out-of-line call here costs the paging-off path too */
+static inline __attribute__((always_inline)) bool
+fm_translate_slow(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr,
+		  int size)
+{
+	TRY(translate(cpu, res, rwm, seg, addr, size, cpu->cpl));
+	if (cpu->cr0 & CR0_PG)
+		fm_fill(cpu, res, rwm, seg, addr);
+	return true;
+}
+
+/*
+ * A window access that was not a probe.  Every host pointer into a window was
+ * probed when it was handed out, so this means a window was flushed under a
+ * live pointer, or a store went through an operand translated for reading.
+ * Neither should happen; if the slow path would allow the access anyway, map
+ * the page and let it retry, and say so.
+ */
+static bool fm_rescue(u8 *a, bool write)
+{
+	CPUI386 *cpu = fm.cpu;
+	for (int k = 0; k < FM_NWIN; k++) {
+		if (a < fm.win[k] || a >= fm.win[k] + FM_WIN_SIZE)
+			continue;
+		uword laddr = a - fm.win[k];
+		bool user = k & 1;
+		if (!(cpu->cr0 & CR0_PG))
+			return false;
+		int excno = cpu->excno;
+		uword excerr = cpu->excerr, cr2 = cpu->cr2, paddr;
+		bool ok = translate_lpgno(cpu, write ? 2 : 1, laddr >> 12,
+					  laddr, user ? 3 : 0, &paddr);
+		cpu->excno = excno;
+		cpu->excerr = excerr;
+		cpu->cr2 = cr2;
+		if (!ok || !fm_is_ram(cpu, paddr))
+			return false;
+		fm_map(user, write, laddr >> 12, paddr >> 12);
+		/* a store through the read window: let that page take it too */
+		if (write && !(k & 2))
+			fm_map1(k, laddr >> 12, paddr >> 12, PROT_READ | PROT_WRITE);
+		if (fm.rescues++ < 16)
+			dolog("fastmem: rescued a %s of %08x at cpl%s, eip %08x\n",
+			      write ? "write" : "read", laddr, user ? "3" : "0-2",
+			      cpu->ip);
+		return true;
+	}
+	return false;
+}
+
+static int fm_extable_cmp(const void *a, const void *b)
+{
+	uintptr_t x = ((const struct fm_extable_entry *) a)->insn;
+	uintptr_t y = ((const struct fm_extable_entry *) b)->insn;
+	return x < y ? -1 : x > y;
+}
+
+static void fm_sigsegv(int sig, siginfo_t *si, void *uctx)
+{
+	ucontext_t *uc = uctx;
+	greg_t *gregs = uc->uc_mcontext.gregs;
+
+	/* a probe: make it return false */
+	struct fm_extable_entry key = { .insn = gregs[REG_RIP] }, *e;
+	e = bsearch(&key, __start_fm_extable,
+		    __stop_fm_extable - __start_fm_extable,
+		    sizeof(key), fm_extable_cmp);
+	if (e) {
+		gregs[REG_RIP] = e->fixup;
+		fm.misses++;
+		return;
+	}
+
+	u8 *a = si->si_addr;
+	if (a >= fm.resv && a < fm.resv + FM_NWIN * FM_WIN_STRIDE) {
+		if (fm_rescue(a, gregs[REG_ERR] & 2))
+			return;
+		dolog("fastmem: unexpected fault at window offset %lx, host rip %llx\n",
+		      (unsigned long) (a - fm.resv), (unsigned long long) gregs[REG_RIP]);
+		cpu_debug(fm.cpu);
+	}
+	/* not ours: put the old handler back and let the access fault again */
+	sigaction(SIGSEGV, &fm.old_segv, NULL);
+}
+
+static void fm_stats(void)
+{
+	dolog("fastmem: %lu probe misses, %lu pages mapped, %lu flushes, %lu invlpgs, %lu rescues, %lu pauses\n",
+	      fm.misses, fm.maps, fm.flushes, fm.invlpgs, fm.rescues, fm.pauses);
+}
+
+static void fm_init(CPUI386 *cpu)
+{
+	const char *env = getenv("TINY386_FASTMEM");
+	if (fm.enabled || (env && !strcmp(env, "0")))
+		return;
+	long size = cpu->phys_mem_size;
+	if (((uintptr_t) cpu->phys_mem | size) & 4095) {
+		dolog("fastmem: guest RAM is not page aligned, disabled\n");
+		return;
+	}
+	if (&__stop_fm_extable[0] == &__start_fm_extable[0]) {
+		dolog("fastmem: no probe table, disabled\n");
+		return;
+	}
+
+	/* move guest RAM into a memfd, keeping its address */
+	int fd = memfd_create("tiny386-ram", MFD_CLOEXEC);
+	if (fd < 0 || ftruncate(fd, size) != 0)
+		goto fail;
+	for (long off = 0; off < size; ) {
+		ssize_t n = pwrite(fd, cpu->phys_mem + off, size - off, off);
+		if (n <= 0)
+			goto fail;
+		off += n;
+	}
+	if (mmap(cpu->phys_mem, size, PROT_READ | PROT_WRITE,
+		 MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED)
+		goto fail;
+
+	u8 *resv = mmap(NULL, FM_NWIN * FM_WIN_STRIDE, PROT_NONE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	if (resv == MAP_FAILED)
+		goto fail;
+
+	qsort(__start_fm_extable, __stop_fm_extable - __start_fm_extable,
+	      sizeof(struct fm_extable_entry), fm_extable_cmp);
+
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = fm_sigsegv;
+	sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGSEGV, &sa, &fm.old_segv) != 0) {
+		munmap(resv, FM_NWIN * FM_WIN_STRIDE);
+		goto fail;
+	}
+
+	fm.fd = fd;
+	fm.resv = resv;
+	for (int k = 0; k < FM_NWIN; k++) {
+		fm.win[k] = resv + k * FM_WIN_STRIDE;
+		fm.nmaps[k] = 0;
+	}
+	fm.cpu = cpu;
+	fm.always = env && !strcmp(env, "always");	/* no governor */
+	fm.enabled = true;
+	if (getenv("TINY386_FASTMEM_STATS"))
+		atexit(fm_stats);
+	dolog("fastmem: on, %ld KiB of guest RAM\n", size >> 10);
+	return;
+fail:
+	dolog("fastmem: setup failed (%s), disabled\n", strerror(errno));
+	if (fd >= 0)
+		close(fd);
+}
+
+static void fm_exit(CPUI386 *cpu)
+{
+	if (!fm.enabled || fm.cpu != cpu)
+		return;
+	sigaction(SIGSEGV, &fm.old_segv, NULL);
+	munmap(fm.resv, FM_NWIN * FM_WIN_STRIDE);
+	fm.enabled = false;
+	fm.cpu = NULL;
+	/* phys_mem stays on the memfd; the fd goes when it is unmapped */
+	close(fm.fd);
+}
+
+/* the segment fast path with paging on: the window for the current CPL */
+static bool fm_segfast_refill(CPUI386 *cpu, struct segfast *sf, int seg)
+{
+	if (!fm_active(cpu))
+		return false;
+	/* a null selector has to fault, so it gets no fast path */
+	if ((cpu->cr0 & 1) && cpu->seg[seg].limit == 0 &&
+	    (cpu->seg[seg].sel & ~0x3) == 0)
+		return false;
+	uword base = cpu->seg[seg].base;
+	/* linear addresses wrap at 4 GiB, the window does not: leave the top
+	 * (and the room for a four byte access) to the slow path */
+	if (base > 0xfffffffc)
+		return false;
+	sf->base = base;
+	sf->host = fm.win[FM_WIN(cpu->cpl == 3, false)] + base;
+	sf->whost = fm.win[FM_WIN(cpu->cpl == 3, true)] + base;
+	sf->lim = (uword) (0x100000000ull - base - 3);
+	sf->probe = true;
+	return true;
+}
+#endif /* USE_FASTMEM */
+
 /*
  * Work out the fast path for one segment, or decide it has none.  Called at
  * most once per segment load, and once more per segment while paging is on
@@ -833,8 +1333,14 @@ static bool segfast_refill(CPUI386 *cpu, int seg)
 	sf->filled = true;
 	sf->lim = 0;
 
+#ifdef USE_FASTMEM
+	sf->probe = false;
+	if (cpu->cr0 & CR0_PG)
+		return fm_segfast_refill(cpu, sf, seg);
+#else
 	if (cpu->cr0 & CR0_PG)
 		return false;
+#endif
 	/* a null selector has to fault, so it gets no fast path */
 	if ((cpu->cr0 & 1) && cpu->seg[seg].limit == 0 &&
 	    (cpu->seg[seg].sel & ~0x3) == 0)
@@ -862,22 +1368,67 @@ static bool segfast_refill(CPUI386 *cpu, int seg)
 
 	sf->base = base;
 	sf->host = cpu->phys_mem + base;
+#ifdef USE_FASTMEM
+	sf->whost = sf->host;
+#endif
 	sf->lim = end - base - 3;	/* room for a four byte access */
 	return true;
 }
 
-static inline bool translate_fast(CPUI386 *cpu, OptAddr *res, int seg,
-				  uword addr)
+static inline bool translate_fast(CPUI386 *cpu, OptAddr *res, int rwm,
+				  int seg, uword addr, int size)
 {
 	struct segfast *sf = &cpu->segfast[seg];
 	if (unlikely(addr >= sf->lim)) {
 		if (sf->filled || !segfast_refill(cpu, seg) || addr >= sf->lim)
 			return false;
 	}
+#ifdef USE_FASTMEM
+	/* a store goes through the write window, which only holds pages the
+	 * guest may write; a load from it is the permission check */
+	u8 *p = ((rwm & 2) ? sf->whost : sf->host) + addr;
+	if (sf->probe) {
+		/* the first byte, and the last one if it is on the next page */
+		uword off = (sf->base + addr) & 0xfff;
+		if (!fm_probe(p) ||
+		    (off > 0x1000 - size && !fm_probe(p + size - 1)))
+			return false;
+	}
+	/* with paging on, addr1 is the linear address: next to a host pointer
+	 * it only says where in its page the operand is */
+	res->res = ADDR_OK1;
+	res->addr1 = sf->base + addr;
+	res->host = p;
+	return true;
+#else
 	res->res = ADDR_OK1;
 	res->addr1 = sf->base + addr;
 	res->host = sf->host + addr;
 	return true;
+#endif
+}
+
+#ifdef USE_FASTMEM
+#define translate_slow(cpu, res, rwm, seg, addr, size) \
+	fm_translate_slow(cpu, res, rwm, seg, addr, size)
+#else
+#define translate_slow(cpu, res, rwm, seg, addr, size) \
+	translate(cpu, res, rwm, seg, addr, size, (cpu)->cpl)
+#endif
+
+/*
+ * Where an operand's page is in host memory, if it is plain RAM to the end of
+ * the page (as a host pointer from the fast path always is), else NULL.  The
+ * rep string helpers hand whole runs of a page to device callbacks.
+ */
+static inline u8 *optaddr_ram_page(CPUI386 *cpu, OptAddr *res)
+{
+	if (res->host)
+		return res->host;
+	if ((res->addr1 | 4095) < cpu->phys_mem_size &&
+	    !in_iomem(res->addr1) && !in_iomem(res->addr1 | 4095))
+		return cpu->phys_mem + res->addr1;
+	return NULL;
 }
 
 /*
@@ -895,23 +1446,23 @@ static inline void optaddr_step(OptAddr *res, int dir)
 
 static inline bool translate8(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr)
 {
-	if (likely(translate_fast(cpu, res, seg, addr)))
+	if (likely(translate_fast(cpu, res, rwm, seg, addr, 1)))
 		return true;
-	return translate(cpu, res, rwm, seg, addr, 1, cpu->cpl);
+	return translate_slow(cpu, res, rwm, seg, addr, 1);
 }
 
 static inline bool translate16(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr)
 {
-	if (likely(translate_fast(cpu, res, seg, addr)))
+	if (likely(translate_fast(cpu, res, rwm, seg, addr, 2)))
 		return true;
-	return translate(cpu, res, rwm, seg, addr, 2, cpu->cpl);
+	return translate_slow(cpu, res, rwm, seg, addr, 2);
 }
 
 static inline bool translate32(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr)
 {
-	if (likely(translate_fast(cpu, res, seg, addr)))
+	if (likely(translate_fast(cpu, res, rwm, seg, addr, 4)))
 		return true;
-	return translate(cpu, res, rwm, seg, addr, 4, cpu->cpl);
+	return translate_slow(cpu, res, rwm, seg, addr, 4);
 }
 
 
@@ -1305,7 +1856,7 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 		cpu->seg[seg].limit = 0xffff;
 		cpu->seg[seg].flags = 0; // D_BIT is not set
 		if (seg == SEG_CS) {
-			cpu->cpl = cpu->flags & VM ? 3 : 0;
+			set_cpl(cpu, cpu->flags & VM ? 3 : 0);
 			cpu->code16 = true;
 		}
 		if (seg == SEG_SS) {
@@ -1347,7 +1898,7 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 			THROW(0x8664, 0);
 		}
 #endif
-		cpu->cpl = sel & 3;
+		set_cpl(cpu, sel & 3);
 		cpu->code16 = !(cpu->seg[SEG_CS].flags & SEG_D_BIT);
 	}
 	if (seg == SEG_SS) {
@@ -2992,13 +3543,14 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 			count = counts; \
 		if (countd < count) \
 			count = countd; \
-		if (cpu->cb.iomem_write_string && in_iomem(memld.addr1) && \
+		u8 *hsrc; \
+		if (cpu->cb.iomem_write_string && !memld.host && \
+		    in_iomem(memld.addr1) && \
 		    dir > 0  && in_iomem(memld.addr1 + count - 1) && \
-		    (memls.addr1 | 4095) < cpu->phys_mem_size && \
-		    !in_iomem(memls.addr1) && !in_iomem(memls.addr1 | 4095)) { \
+		    (hsrc = optaddr_ram_page(cpu, &memls))) { \
 			if (cpu->cb.iomem_write_string( \
 				    cpu->cb.iomem, memld.addr1, \
-				    cpu->phys_mem + memls.addr1, count * dir)) { \
+				    hsrc, count * dir)) { \
 				sreg ## ABIT(6, lreg ## ABIT(6) + count * dir); \
 				sreg ## ABIT(7, lreg ## ABIT(7) + count * dir); \
 				sreg ## ABIT(1, cx - count); \
@@ -3102,12 +3654,12 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		else countd = 1 + (memld.addr1 & 4095) / (BIT / 8); \
 		if (countd < count) \
 			count = countd; \
+		u8 *hdst; \
 		if (cpu->cb.io_read_string && dir > 0 && \
-		    (memld.addr1 | 4095) < cpu->phys_mem_size && \
-		    !in_iomem(memld.addr1) && !in_iomem(memld.addr1 | 4095)) { \
+		    (hdst = optaddr_ram_page(cpu, &memld))) { \
 			int count1 = cpu->cb.io_read_string( \
 				cpu->cb.io, lreg16(2), \
-				cpu->phys_mem + memld.addr1, dir, count); \
+				hdst, dir, count); \
 			if (count1 > 0) { \
 				count = count1; \
 				sreg ## ABIT(7, lreg ## ABIT(7) + count * dir); \
@@ -3165,12 +3717,12 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		else counts = 1 + (memls.addr1 & 4095) / (BIT / 8); \
 		if (counts < count) \
 			count = counts; \
+		u8 *hsrc; \
 		if (cpu->cb.io_write_string && dir > 0 && \
-		    (memls.addr1 | 4095) < cpu->phys_mem_size && \
-		    !in_iomem(memls.addr1) && !in_iomem(memls.addr1 | 4095)) { \
+		    (hsrc = optaddr_ram_page(cpu, &memls))) { \
 			int count1 = cpu->cb.io_write_string( \
 				cpu->cb.io, lreg16(2), \
-				cpu->phys_mem + memls.addr1, dir, count); \
+				hsrc, dir, count); \
 			if (count1 > 0) { \
 				count = count1; \
 				sreg ## ABIT(6, lreg ## ABIT(6) + count * dir); \
@@ -3976,7 +4528,12 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 #define XADDw(...) XADD_helper(16, __VA_ARGS__)
 #define XADDd(...) XADD_helper(32, __VA_ARGS__)
 
+#ifdef USE_FASTMEM
+#define INVLPG(addr) \
+	tlb_invlpg(cpu, cpu->seg[curr_seg == -1 ? SEG_DS : curr_seg].base + (addr));
+#else
 #define INVLPG(addr) tlb_clear(cpu);
+#endif
 
 #define BSWAPw(a, la, sa) THROW0(EX_UD);
 
@@ -4116,7 +4673,7 @@ static void __sysenter(CPUI386 *cpu, int pl, int cs)
 	cpu->seg[SEG_CS].base = 0;
 	cpu->seg[SEG_CS].limit = 0xffffffff;
 	cpu->seg[SEG_CS].flags = SEG_D_BIT | 0x5b | (pl << 5);
-	cpu->cpl = pl;
+	set_cpl(cpu, pl);
 	cpu->code16 = false;
 	cpu->sp_mask = 0xffffffff;
 	cpu->seg[SEG_SS].sel = ((cs + 8) & 0xfffc) | pl;
@@ -5354,6 +5911,9 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 
 	int ret = cpu_exec1(cpu, stepcount);
 	cpu->ifetch.paddr = 0;
+#ifdef USE_FASTMEM
+	fm_tick(cpu);
+#endif
 	if (!ret) {
 #ifdef AMD64_ENABLE_LEG32
 		if (cpu->excno == 0x8664)
@@ -5518,6 +6078,9 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 
 	cpu->phys_mem = (u8 *) phys_mem;
 	cpu->phys_mem_size = phys_mem_size;
+#ifdef USE_FASTMEM
+	fm_init(cpu);
+#endif
 
 	cpu->cycle = 0;
 
@@ -5541,6 +6104,9 @@ void cpui386_enable_fpu(CPUI386 *cpu)
 
 void cpui386_delete(CPUI386 *cpu)
 {
+#ifdef USE_FASTMEM
+	fm_exit(cpu);
+#endif
 	if (cpu->fpu)
 		fpu_delete(cpu->fpu);
 #ifndef BUILD_ESP32
