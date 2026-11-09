@@ -20,6 +20,11 @@
 #define I386_OPT2
 #endif
 
+/* fastmem on a 32-bit host: the windows cover part of the linear space */
+#if defined(USE_FASTMEM) && UINTPTR_MAX == 0xffffffff
+#define FM_PARTIAL
+#endif
+
 #ifdef I386_ENABLE_FPU
 #include "fpu.h"
 #else
@@ -79,6 +84,10 @@ struct CPUI386 {
 		 * and every access probes the host MMU first (see fm_probe) */
 		u8 *whost;
 		bool probe;
+#endif
+#ifdef FM_PARTIAL
+		/* the fast offsets are [off, off + lim), not [0, lim) */
+		uword off;
 #endif
 	} segfast[8];
 
@@ -868,8 +877,8 @@ static inline bool in_iomem(uword addr)
 
 #ifdef USE_FASTMEM
 /*
- * Fastmem: the host MMU translates guest linear addresses (Linux/x86-64 hosts
- * only, `make USE_FASTMEM=y`).
+ * Fastmem: the host MMU translates guest linear addresses (Linux hosts on
+ * x86-64 or 32-bit ARM, `make USE_FASTMEM=y`).
  *
  * Guest RAM lives in a memfd, and phys_mem is remapped onto it, so the rest of
  * the emulator keeps its pointer.  Four 4 GiB windows of host address space
@@ -898,17 +907,31 @@ static inline bool in_iomem(uword addr)
  * CR0/CR3 writes, invlpg, task switches, reset).  A CPL change switches
  * windows instead.  Paging off needs none of this: segfast already points
  * straight into phys_mem then.
+ *
+ * A 32-bit host (ARMv7) has no room for 4 GiB windows, so there each window
+ * covers only part of the guest's linear space, [fm.lin_base, +fm.win_size)
+ * (TINY386_FASTMEM_WINDOW=base,size; 256 MiB from 0 by default), and the
+ * segment fast path is bounded to it.  Accesses outside it take the TLB path
+ * after one compare, as without fastmem.
  */
-#if !defined(__linux__) || !defined(__x86_64__)
-#error "USE_FASTMEM needs a Linux x86-64 host"
+#if !defined(__linux__) || !(defined(__x86_64__) || defined(__arm__))
+#error "USE_FASTMEM needs a Linux host on x86-64 or 32-bit ARM"
 #endif
 #include <errno.h>
 #include <signal.h>
 #include <ucontext.h>
 #include <sys/mman.h>
 
-#define FM_WIN_SIZE (1ul << 32)
-#define FM_WIN_STRIDE (FM_WIN_SIZE + (1ul << 16))	/* a guard between windows */
+#ifdef FM_PARTIAL
+/* the windows cover part of the linear space: see above */
+#define FM_WIN_SIZE fm.win_size
+#define FM_LIN_BASE fm.lin_base
+#else
+#define FM_WIN_SIZE ((size_t) 1 << 32)
+#define FM_LIN_BASE ((uword) 0)
+#endif
+#define FM_GUARD ((size_t) 1 << 16)	/* between windows */
+#define FM_WIN_STRIDE (FM_WIN_SIZE + FM_GUARD)
 #define FM_NWIN 4
 /* window index: CPL 3 or not, and read or write */
 #define FM_WIN(user, write) (((user) ? 1 : 0) | ((write) ? 2 : 0))
@@ -934,17 +957,48 @@ static struct {
 	bool paused, always;
 	unsigned long tick_misses;
 	long tick_cycle, next_tick;
+#ifdef FM_PARTIAL
+	size_t win_size;	/* bytes of linear space a window covers */
+	uword lin_base;		/* the first linear address it covers */
+#endif
 } fm;
+
+/* is the linear page lpgno inside the windows? */
+static inline bool fm_covers(uword lpgno)
+{
+#ifdef FM_PARTIAL
+	return lpgno - (FM_LIN_BASE >> 12) < (FM_WIN_SIZE >> 12);
+#else
+	(void) lpgno;
+	return true;
+#endif
+}
+
+/* where linear address laddr is in window k (laddr must be covered) */
+static inline u8 *fm_host(int k, uword laddr)
+{
+	return fm.win[k] + (uword) (laddr - FM_LIN_BASE);
+}
 
 /* load the byte at p; false if the host MMU says no */
 static inline bool fm_probe(const u8 *p)
 {
+#if defined(__x86_64__)
 	asm goto("1: cmpb $0, (%0)\n\t"
 		 ".pushsection fm_extable, \"aw\"\n\t"
 		 ".balign 8\n\t"
 		 ".quad 1b, %l[fault]\n\t"
 		 ".popsection"
 		 : : "r" (p) : "cc" : fault);
+#else
+	/* ARM or Thumb-2; the fixup keeps the mode the probe ran in */
+	asm goto("1: ldrb ip, [%0]\n\t"
+		 ".pushsection fm_extable, \"aw\"\n\t"
+		 ".balign 4\n\t"
+		 ".word 1b, %l[fault]\n\t"
+		 ".popsection"
+		 : : "r" (p) : "ip" : fault);
+#endif
 	return true;
 fault:
 	return false;
@@ -1009,10 +1063,12 @@ static void fm_invlpg(CPUI386 *cpu, uword laddr)
 	if (!fm.enabled || fm.cpu != cpu)
 		return;
 	fm.invlpgs++;
+	if (!fm_covers(laddr >> 12))
+		return;
 	for (int k = 0; k < FM_NWIN; k++) {
 		if (!fm.nmaps[k])
 			continue;
-		if (mmap(fm.win[k] + (laddr & ~(uword) 0xfff), 4096, PROT_NONE,
+		if (mmap(fm_host(k, laddr & ~(uword) 0xfff), 4096, PROT_NONE,
 			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
 			 -1, 0) == MAP_FAILED) {
 			dolog("fastmem: invlpg failed: %s\n", strerror(errno));
@@ -1024,9 +1080,9 @@ static void fm_invlpg(CPUI386 *cpu, uword laddr)
 /* map linear page lpgno of window k onto physical page ppgno */
 static void fm_map1(int k, uword lpgno, uword ppgno, int prot)
 {
-	if (fm.nmaps[k] >= FM_MAX_MAPS)
+	if (fm.nmaps[k] >= FM_MAX_MAPS || !fm_covers(lpgno))
 		return;		/* full until the next flush: slow path till then */
-	if (mmap(fm.win[k] + ((uintptr_t) lpgno << 12), 4096, prot,
+	if (mmap(fm_host(k, lpgno << 12), 4096, prot,
 		 MAP_SHARED | MAP_FIXED, fm.fd, (off_t) ppgno << 12) == MAP_FAILED) {
 		fm.nmaps[k] = FM_MAX_MAPS;
 		return;
@@ -1074,7 +1130,8 @@ static int fm_run(CPUI386 *cpu, uword lpgno, uword ppgno, bool user, bool write)
 	uword pt = pde & ~0xfff;
 	int (*lookup)[4][2][2] = &pte_lookup[!!(cpu->cr0 & CR0_WP)];
 	int n = 0;
-	for (; n < FM_RUN && ((lpgno + n) & 1023) >= (lpgno & 1023); n++) {
+	for (; n < FM_RUN && ((lpgno + n) & 1023) >= (lpgno & 1023) &&
+	       fm_covers(lpgno + n); n++) {
 		uword pteaddr = pt + ((lpgno + n) & 1023) * 4;
 		if (pteaddr + 4 > cpu->phys_mem_size)
 			break;
@@ -1095,7 +1152,7 @@ static void fm_map_run(int k, uword lpgno, uword ppgno, int n, int prot)
 {
 	if (n <= 0 || fm.nmaps[k] >= FM_MAX_MAPS)
 		return;
-	if (mmap(fm.win[k] + ((uintptr_t) lpgno << 12), (size_t) n << 12, prot,
+	if (mmap(fm_host(k, lpgno << 12), (size_t) n << 12, prot,
 		 MAP_SHARED | MAP_FIXED, fm.fd, (off_t) ppgno << 12) == MAP_FAILED) {
 		fm.nmaps[k] = FM_MAX_MAPS;
 		return;
@@ -1154,7 +1211,7 @@ static bool fm_rescue(u8 *a, bool write)
 	for (int k = 0; k < FM_NWIN; k++) {
 		if (a < fm.win[k] || a >= fm.win[k] + FM_WIN_SIZE)
 			continue;
-		uword laddr = a - fm.win[k];
+		uword laddr = (uword) (a - fm.win[k]) + FM_LIN_BASE;
 		bool user = k & 1;
 		if (!(cpu->cr0 & CR0_PG))
 			return false;
@@ -1187,28 +1244,37 @@ static int fm_extable_cmp(const void *a, const void *b)
 	return x < y ? -1 : x > y;
 }
 
+/* the faulting pc, and whether the fault was a write */
+#if defined(__x86_64__)
+#define FM_PC(uc) ((uc)->uc_mcontext.gregs[REG_RIP])
+#define FM_WRITE(uc) ((uc)->uc_mcontext.gregs[REG_ERR] & 2)
+#else
+/* the Thumb state is in cpsr, not in the pc; the DFSR's WnR bit says write */
+#define FM_PC(uc) ((uc)->uc_mcontext.arm_pc)
+#define FM_WRITE(uc) (((uc)->uc_mcontext.error_code >> 11) & 1)
+#endif
+
 static void fm_sigsegv(int sig, siginfo_t *si, void *uctx)
 {
 	ucontext_t *uc = uctx;
-	greg_t *gregs = uc->uc_mcontext.gregs;
 
 	/* a probe: make it return false */
-	struct fm_extable_entry key = { .insn = gregs[REG_RIP] }, *e;
+	struct fm_extable_entry key = { .insn = FM_PC(uc) }, *e;
 	e = bsearch(&key, __start_fm_extable,
 		    __stop_fm_extable - __start_fm_extable,
 		    sizeof(key), fm_extable_cmp);
 	if (e) {
-		gregs[REG_RIP] = e->fixup;
+		FM_PC(uc) = e->fixup;
 		fm.misses++;
 		return;
 	}
 
 	u8 *a = si->si_addr;
 	if (a >= fm.resv && a < fm.resv + FM_NWIN * FM_WIN_STRIDE) {
-		if (fm_rescue(a, gregs[REG_ERR] & 2))
+		if (fm_rescue(a, FM_WRITE(uc)))
 			return;
-		dolog("fastmem: unexpected fault at window offset %lx, host rip %llx\n",
-		      (unsigned long) (a - fm.resv), (unsigned long long) gregs[REG_RIP]);
+		dolog("fastmem: unexpected fault at window offset %lx, host pc %lx\n",
+		      (unsigned long) (a - fm.resv), (unsigned long) FM_PC(uc));
 		cpu_debug(fm.cpu);
 	}
 	/* not ours: put the old handler back and let the access fault again */
@@ -1235,6 +1301,36 @@ static void fm_init(CPUI386 *cpu)
 		dolog("fastmem: no probe table, disabled\n");
 		return;
 	}
+#ifdef FM_PARTIAL
+	/* TINY386_FASTMEM_WINDOW=base,size (size may end in M) */
+	fm.lin_base = 0;
+	fm.win_size = 256 << 20;
+	const char *w = getenv("TINY386_FASTMEM_WINDOW");
+	if (w) {
+		char *end;
+		unsigned long long b = strtoull(w, &end, 0), sz = fm.win_size;
+		if (*end == ',') {
+			sz = strtoull(end + 1, &end, 0);
+			if (*end == 'M' || *end == 'm')
+				sz <<= 20;
+		}
+		if ((b | sz) & 4095 || !sz || b + sz > 0x100000000ull ||
+		    sz > (1u << 30)) {
+			dolog("fastmem: bad TINY386_FASTMEM_WINDOW, disabled\n");
+			return;
+		}
+		fm.lin_base = b;
+		fm.win_size = sz;
+	}
+#endif
+#if defined(__arm__)
+	/* Thumb code labels may carry the Thumb bit; the pc in a signal frame
+	 * does not */
+	for (struct fm_extable_entry *e = __start_fm_extable; e < __stop_fm_extable; e++) {
+		e->insn &= ~(uintptr_t) 1;
+		e->fixup &= ~(uintptr_t) 1;
+	}
+#endif
 
 	/* move guest RAM into a memfd, keeping its address */
 	int fd = memfd_create("tiny386-ram", MFD_CLOEXEC);
@@ -1279,7 +1375,12 @@ static void fm_init(CPUI386 *cpu)
 	fm.enabled = true;
 	if (getenv("TINY386_FASTMEM_STATS"))
 		atexit(fm_stats);
+#ifdef FM_PARTIAL
+	dolog("fastmem: on, %ld KiB of guest RAM, windows cover %08x-%08x\n",
+	      size >> 10, fm.lin_base, (uword) (fm.lin_base + fm.win_size - 1));
+#else
 	dolog("fastmem: on, %ld KiB of guest RAM\n", size >> 10);
+#endif
 	return;
 fail:
 	dolog("fastmem: setup failed (%s), disabled\n", strerror(errno));
@@ -1309,14 +1410,25 @@ static bool fm_segfast_refill(CPUI386 *cpu, struct segfast *sf, int seg)
 	    (cpu->seg[seg].sel & ~0x3) == 0)
 		return false;
 	uword base = cpu->seg[seg].base;
-	/* linear addresses wrap at 4 GiB, the window does not: leave the top
-	 * (and the room for a four byte access) to the slow path */
-	if (base > 0xfffffffc)
+	/* the offsets whose linear address is in the windows, less room for a
+	 * four byte access at the end: [off, off + lim).  Linear addresses wrap
+	 * at 4 GiB and the windows do not, so the top goes the slow way. */
+	uint64_t lo = FM_LIN_BASE, hi = lo + FM_WIN_SIZE - 3;
+	uint64_t first = base > lo ? base : lo;
+	if (first >= hi)
 		return false;
+#ifdef FM_PARTIAL
+	sf->off = (uword) (first - base);
+#else
+	if (first != base)
+		return false;
+#endif
+	sf->lim = (uword) (hi - first);
 	sf->base = base;
-	sf->host = fm.win[FM_WIN(cpu->cpl == 3, false)] + base;
-	sf->whost = fm.win[FM_WIN(cpu->cpl == 3, true)] + base;
-	sf->lim = (uword) (0x100000000ull - base - 3);
+	/* host + addr is where base + addr is in the window */
+	uintptr_t delta = (uword) (base - FM_LIN_BASE);
+	sf->host = (u8 *) ((uintptr_t) fm.win[FM_WIN(cpu->cpl == 3, false)] + delta);
+	sf->whost = (u8 *) ((uintptr_t) fm.win[FM_WIN(cpu->cpl == 3, true)] + delta);
 	sf->probe = true;
 	return true;
 }
@@ -1332,6 +1444,9 @@ static bool segfast_refill(CPUI386 *cpu, int seg)
 	struct segfast *sf = &cpu->segfast[seg];
 	sf->filled = true;
 	sf->lim = 0;
+#ifdef FM_PARTIAL
+	sf->off = 0;
+#endif
 
 #ifdef USE_FASTMEM
 	sf->probe = false;
@@ -1379,10 +1494,18 @@ static inline bool translate_fast(CPUI386 *cpu, OptAddr *res, int rwm,
 				  int seg, uword addr, int size)
 {
 	struct segfast *sf = &cpu->segfast[seg];
+#ifdef FM_PARTIAL
+	if (unlikely(addr - sf->off >= sf->lim)) {
+		if (sf->filled || !segfast_refill(cpu, seg) ||
+		    addr - sf->off >= sf->lim)
+			return false;
+	}
+#else
 	if (unlikely(addr >= sf->lim)) {
 		if (sf->filled || !segfast_refill(cpu, seg) || addr >= sf->lim)
 			return false;
 	}
+#endif
 #ifdef USE_FASTMEM
 	/* a store goes through the write window, which only holds pages the
 	 * guest may write; a load from it is the permission check */

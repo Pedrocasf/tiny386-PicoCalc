@@ -111,7 +111,7 @@ SRCS_I386_n = i386.c
 SRCS_I386_y = fast/fast.c
 SRCS_I386_pd = fast/fast.c
 
-#USE_FASTMEM = n/y: the host MMU translates guest linear addresses for i386.c (Linux x86-64 hosts only)
+#USE_FASTMEM = n/y: the host MMU translates guest linear addresses for i386.c (Linux hosts on x86-64 or 32-bit ARM)
 USE_FASTMEM = n
 CFLAGS_FASTMEM_y = -DUSE_FASTMEM -D_GNU_SOURCE
 CFLAGS += ${CFLAGS_FASTMEM_${USE_FASTMEM}}
