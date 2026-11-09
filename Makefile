@@ -111,6 +111,11 @@ SRCS_I386_n = i386.c
 SRCS_I386_y = fast/fast.c
 SRCS_I386_pd = fast/fast.c
 
+#USE_FASTMEM = n/y: the host MMU translates guest linear addresses for i386.c (Linux x86-64 hosts only)
+USE_FASTMEM = n
+CFLAGS_FASTMEM_y = -DUSE_FASTMEM -D_GNU_SOURCE
+CFLAGS += ${CFLAGS_FASTMEM_${USE_FASTMEM}}
+
 #USE_AMD64 = n/y/full
 USE_AMD64 = n
 CFLAGS_AMD64_y = -DUSE_AMD64
@@ -154,9 +159,9 @@ OBJS = ${SRCS:.c=.o}
 
 all: show ${PROGS}
 
-# the CPU's object (i386.o, or fast/fast.o built for y or pd) is rebuilt when USE_FAST changes, and the programs relinked
-i386.o fast/fast.o: .fast-${USE_FAST}
-.fast-${USE_FAST}:
+# the CPU's object (i386.o, or fast/fast.o built for y or pd) is rebuilt when USE_FAST or USE_FASTMEM changes, and the programs relinked
+i386.o fast/fast.o: .fast-${USE_FAST}-${USE_FASTMEM}
+.fast-${USE_FAST}-${USE_FASTMEM}:
 	@rm -f .fast-*
 	@touch $@
 
@@ -169,6 +174,7 @@ clean:
 show:
 	@echo CC = ${CC}
 	@echo USE_FAST = ${USE_FAST}
+	@echo USE_FASTMEM = ${USE_FASTMEM}
 	@echo USE_AMD64 = ${USE_AMD64}
 	@echo USE_CPUABS = ${USE_CPUABS}
 	@echo USE_SDL = ${USE_SDL}

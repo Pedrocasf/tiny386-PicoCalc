@@ -92,6 +92,10 @@ struct bench {
 	uint32_t chk_addr;
 	uint16_t chk_val;
 	const uint8_t code[48];
+	/* run in flat 32-bit protected mode with paging on, which is where
+	 * guest memory goes through the TLB (or, under USE_FASTMEM, the host
+	 * MMU) */
+	bool paged;
 };
 
 static const struct bench benches[] = {
@@ -149,29 +153,115 @@ static const struct bench benches[] = {
 		0xeb, 0x00,
 		0x90,
 	} },
+	/*
+	 * The same under paging, with the first 4 MiB identity mapped (see
+	 * bench_paging), so the memory operands take the paging path instead
+	 * of the paging-off segment fast path.
+	 */
+	{ "pg mov eax,[ebx]", 2, 0, 0, {0x8b, 0x03}, true },
+	{ "pg add [ebx],eax", 2, 0, 0, {0x01, 0x03}, true },
+	/*
+	 * mixed again, with dword operands spaced out so that, again, nothing
+	 * read is ever written: edx settles at 1 and eax at 0-1, at 0x8010
+	 *
+	 *   mov ebx,8000      bb 00 80 00 00
+	 *   mov al,[ebx]      8a 03
+	 *   add al,cl         00 c8
+	 *   mov [ebx+20],al   88 43 14
+	 *   mov edx,[ebx+4]   8b 53 04
+	 *   add edx,1         83 c2 01
+	 *   mov [ebx+8],edx   89 53 08
+	 *   jz  +0            74 00
+	 *   jnz +0            75 00
+	 *   mov ecx,[ebx+12]  8b 4b 0c
+	 *   shl ecx,1         d1 e1
+	 *   mov eax,ecx       89 c8
+	 *   sub eax,edx       29 d0
+	 *   mov [ebx+16],eax  89 43 10
+	 *   jmp +0            eb 00
+	 *   nop               90
+	 */
+	{ "pg mixed",     40, 0x8010, 0xffff, {
+		0xbb, 0x00, 0x80, 0x00, 0x00,
+		0x8a, 0x03,
+		0x00, 0xc8,
+		0x88, 0x43, 0x14,
+		0x8b, 0x53, 0x04,
+		0x83, 0xc2, 0x01,
+		0x89, 0x53, 0x08,
+		0x74, 0x00,
+		0x75, 0x00,
+		0x8b, 0x4b, 0x0c,
+		0xd1, 0xe1,
+		0x89, 0xc8,
+		0x29, 0xd0,
+		0x89, 0x43, 0x10,
+		0xeb, 0x00,
+		0x90,
+	}, true },
 };
+
+#define BENCH_PD 0x10000	/* a page directory, then its one page table */
+
+/*
+ * For the paged rows: identity map the first 4 MiB through one page table,
+ * and plant the prologue that turns paging on from flat protected mode.
+ * Returns the prologue's length.
+ */
+static int bench_paging(PC *pc, uint8_t *body)
+{
+	uint8_t *pd = (uint8_t *) pc->phys_mem + BENCH_PD;
+	uint8_t *pt = pd + 4096;
+	memset(pd, 0, 8192);
+	uint32_t pde = (BENCH_PD + 4096) | 7;	/* present, writable, user */
+	memcpy(pd, &pde, 4);
+	for (uint32_t i = 0; i < 1024; i++) {
+		uint32_t pte = (i << 12) | 7;
+		memcpy(pt + i * 4, &pte, 4);
+	}
+	static const uint8_t prologue[] = {
+		0xb8, BENCH_PD & 0xff, (BENCH_PD >> 8) & 0xff,
+		(BENCH_PD >> 16) & 0xff, 0x00,	/* mov eax,BENCH_PD */
+		0x0f, 0x22, 0xd8,		/* mov cr3,eax */
+		0x0f, 0x20, 0xc0,		/* mov eax,cr0 */
+		0x0d, 0x00, 0x00, 0x00, 0x80,	/* or eax,80000000 */
+		0x0f, 0x22, 0xc0,		/* mov cr0,eax */
+	};
+	memcpy(body, prologue, sizeof(prologue));
+	return sizeof(prologue);
+}
 
 static void bench_one(PC *pc, const struct bench *b)
 {
 	uint8_t *body = (uint8_t *) pc->phys_mem + BENCH_BODY;
-	int off = 0;
+	int top = b->paged ? bench_paging(pc, body) : 0;	/* loop start */
+	int off = top;
 
 	for (int i = 0; i < BENCH_REPS; i++, off += b->len)
 		memcpy(body + off, b->code, b->len);
-	if (off + 2 <= 128) {
+	if (off + 2 - top <= 128) {
 		body[off] = 0xeb;		/* jmp rel8 back to the top */
-		body[off + 1] = (uint8_t) -(off + 2);
-	} else {
+		body[off + 1] = (uint8_t) -(off + 2 - top);
+	} else if (!b->paged) {
 		int rel = -(off + 3);		/* too far for rel8 */
 		body[off] = 0xe9;
 		body[off + 1] = rel & 0xff;
 		body[off + 2] = (rel >> 8) & 0xff;
+	} else {
+		int32_t rel = -(off + 5 - top);	/* jmp rel32 in 32-bit code */
+		body[off] = 0xe9;
+		memcpy(body + off + 1, &rel, 4);
 	}
 
+	if (b->paged)
+		memset((uint8_t *) pc->phys_mem + 0x8000, 0, 0x20);
 	if (b->chk_addr)
 		memset((uint8_t *) pc->phys_mem + b->chk_addr, 0, 2);
 
-	cpui386_reset(pc->cpu);			/* back to f000:fff0 */
+	if (b->paged)
+		cpui386_reset_pm(pc->cpu, BENCH_BODY);	/* flat 32-bit, cpl 0 */
+	else
+		cpui386_reset(pc->cpu);		/* back to f000:fff0 */
 
 	uint32_t t0 = get_uticks();
 	long c0 = cpui386_get_cycle(pc->cpu);
