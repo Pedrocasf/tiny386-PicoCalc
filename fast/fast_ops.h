@@ -125,10 +125,7 @@ FL(op_8e): { u8 m = *pc++; int r = (m >> 3) & 7, rm = m & 7;   // MOV Sw,Ew (pro
 		if (!FAST_LOAD_SEG(r, sel)) goto slow;
 		NEXT;
 	}
-	cpu->seg[r].sel = sel;
-	cpu->seg[r].base = sel << 4;
-	cpu->seg[r].limit = 0xffff;
-	cpu->seg[r].flags = 0;
+	fast_load_seg_real(cpu, r, sel);
 	if (r == SEG_SS) {
 		sp_mask = cpu->sp_mask = 0xffff;
 		steps++;   // no interrupt before the next instruction
@@ -282,10 +279,7 @@ FL(op_pop_seg): {
 		NEXT;
 	}
 	SP_ADD(opsz16 ? 2 : 4);
-	cpu->seg[sg].sel = sel;
-	cpu->seg[sg].base = sel << 4;
-	cpu->seg[sg].limit = 0xffff;
-	cpu->seg[sg].flags = 0;
+	fast_load_seg_real(cpu, sg, sel);
 	if (sg == SEG_SS) {
 		sp_mask = cpu->sp_mask = 0xffff;
 		steps++;
@@ -308,18 +302,12 @@ FL(op_les): FL(op_lds): { u8 m = *pc++; int r = (m >> 3) & 7;
 	if (opsz16) {
 		EA_PTR(p, m, 4, 0);
 		sreg16(r, fm16(p));
-		u16 sel = fm16(p + 2);
-		cpu->seg[sg].sel = sel;
-		cpu->seg[sg].base = sel << 4;
+		fast_load_seg_real(cpu, sg, fm16(p + 2));
 	} else {
 		EA_PTR(p, m, 6, 0);
 		sreg32(r, fm32(p));
-		u16 sel = fm16(p + 4);
-		cpu->seg[sg].sel = sel;
-		cpu->seg[sg].base = sel << 4;
+		fast_load_seg_real(cpu, sg, fm16(p + 4));
 	}
-	cpu->seg[sg].limit = 0xffff;
-	cpu->seg[sg].flags = 0;
 	NEXT; }
 
 	// IMUL with an immediate, PUSHF/POPF, flags
@@ -491,11 +479,8 @@ FL(op_leave): {
 
 	// far jumps, calls, returns, INT, IRET: real mode here, protected mode by pmcall/pmret or tiny386
 #define LOAD_CS(sel) do { \
-		cpu->seg[SEG_CS].sel = (sel); \
-		cpu->seg[SEG_CS].base = (uword) (sel) << 4; \
-		cpu->seg[SEG_CS].limit = 0xffff; \
-		cpu->seg[SEG_CS].flags = 0; \
-		cpu->cpl = cpu->flags & VM ? 3 : 0; \
+		fast_load_seg_real(cpu, SEG_CS, (sel)); \
+		set_cpl(cpu, cpu->flags & VM ? 3 : 0); \
 		cpu->code16 = true; \
 	} while (0)
 FL(op_jmpf): {

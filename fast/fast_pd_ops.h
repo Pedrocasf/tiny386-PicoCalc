@@ -221,7 +221,7 @@ pd_out_##N##d: { PD_BEGIN; if (!IO_ALLOWED) goto pd_slow; FV_SKIP; cpu->cb.io_wr
 	// ---- segment registers (protected mode: set_seg), PUSHA POPA ENTER, POP to memory
 #define PD_LOAD_SEG(sg, v) do { \
 		if (PROTECTED) { if (!FAST_LOAD_SEG((sg), (v))) goto pd_slow; } \
-		else { cpu->seg[sg].sel = (v); cpu->seg[sg].base = (v) << 4; cpu->seg[sg].limit = 0xffff; cpu->seg[sg].flags = 0; } \
+		else fast_load_seg_real(cpu, (sg), (v)); \
 	} while (0)
 pd_push_sw: { PD_BEGIN; PD_STACK(s, -2, 2, 1); SP_ADD(-2); fs16(s, cpu->seg[pu->r].sel); PD_NEXT; }
 pd_push_sd: { PD_BEGIN; PD_STACK(s, -4, 2, 1); SP_ADD(-4); fs16(s, cpu->seg[pu->r].sel); PD_NEXT; }
