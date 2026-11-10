@@ -146,6 +146,17 @@ static inline unsigned fast_nullsegs(CPUI386 *cpu)
 	return m;
 }
 
+/* real-mode or virtual-8086 load of a segment register, as set_seg does it: i386.c caches where each segment's
+ * base lands in phys_mem (struct segfast), so the cached entry has to go with the old base */
+static inline __attribute__((always_inline)) void fast_load_seg_real(CPUI386 *cpu, int sg, u16 sel)
+{
+	segfast_invalidate1(cpu, sg);
+	cpu->seg[sg].sel = sel;
+	cpu->seg[sg].base = (uword) sel << 4;
+	cpu->seg[sg].limit = 0xffff;
+	cpu->seg[sg].flags = 0;
+}
+
 /* ---- operands */
 static const u8 fast_r8off[8] = { 0, 4, 8, 12, 1, 5, 9, 13 };   /* AL CL DL BL AH CH DH BH in gprx */
 #define fr8(i) (((u8 *) cpu->gprx)[fast_r8off[i]])
