@@ -13,6 +13,11 @@ typedef struct VGAState VGAState;
 VGAState *vga_init(char *vga_ram, int vga_ram_size,
                    uint8_t *fb, int width, int height);
 void vga_set_force_8dm(VGAState *s, int v);
+/* draw text mode with a 4x10 font (80x25 in 320x250): for small displays;
+   in 32 bpp builds, and always on with SMALL_TEXT_FONT */
+void vga_set_small_text(VGAState *s, int on);
+/* the part of the frame buffer the guest's picture was last drawn in */
+void vga_get_picture(VGAState *s, int *x, int *y, int *w, int *h);
 
 int vga_step(VGAState *vga);
 void vga_refresh(VGAState *s,

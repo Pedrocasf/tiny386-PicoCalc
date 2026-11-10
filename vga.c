@@ -154,6 +154,10 @@ struct VGAState {
     bool blink_visible;             /* blinking characters, now */
     /* where the text was last drawn; last_text_w1 -1: just cleared */
     int last_text_x1, last_text_y1, last_text_w1, last_text_h1;
+    /* text mode with the 4x10 font (SMALL_TEXT_FONT, vga_set_small_text()) */
+    int small_text;
+    /* the part of the frame buffer the picture was last drawn in */
+    int pic_x, pic_y, pic_w, pic_h;
 
     /* VBE extension */
     uint16_t vbe_index;
@@ -783,12 +787,53 @@ static void vbe_update_vgaregs(VGAState *s)
     simplefb_clear(s->fb_dev);
 }
 
-#ifdef SMALL_TEXT_FONT
-#if BPP != 16
-#error "SMALL_TEXT_FONT requires BPP == 16"
+static void set_picture(VGAState *s, int x, int y, int w, int h)
+{
+    FBDevice *fb_dev = s->fb_dev;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (w > fb_dev->width - x) w = fb_dev->width - x;
+    if (h > fb_dev->height - y) h = fb_dev->height - y;
+    if (w <= 0 || h <= 0) {
+        x = y = 0;
+        w = fb_dev->width;
+        h = fb_dev->height;
+    }
+    s->pic_x = x;
+    s->pic_y = y;
+    s->pic_w = w;
+    s->pic_h = h;
+}
+
+void vga_get_picture(VGAState *s, int *x, int *y, int *w, int *h)
+{
+    *x = s->pic_x;
+    *y = s->pic_y;
+    *w = s->pic_w;
+    *h = s->pic_h;
+}
+
+/* The 4x10 font: always with SMALL_TEXT_FONT (the PicoCalc), and at run time
+   (vga_set_small_text()) in 32 bpp builds, for frontends on small displays. */
+#if defined(SMALL_TEXT_FONT) || BPP == 32
+#define HAVE_SMALL_TEXT
+#endif
+
+void vga_set_small_text(VGAState *s, int on)
+{
+#ifdef HAVE_SMALL_TEXT
+    s->small_text = on;
+#endif
+}
+
+#ifdef HAVE_SMALL_TEXT
+#if BPP != 16 && BPP != 32
+#error "SMALL_TEXT_FONT requires BPP == 16 or 32"
 #endif
 #include "font_small.h"
 
+#if BPP == 16
+typedef uint16_t small_pix_t;
 static inline uint16_t small_pix(uint32_t c)
 {
 #ifdef SWAP_BYTEORDER_BPP16
@@ -797,6 +842,13 @@ static inline uint16_t small_pix(uint32_t c)
     return (uint16_t) c;
 #endif
 }
+#else
+typedef uint32_t small_pix_t;
+static inline uint32_t small_pix(uint32_t c)
+{
+    return c;
+}
+#endif
 
 /* Draw text mode 1:1 with the built-in 4x10 font instead of downscaling an
    8x16 one, which turns to mush on a small panel.  Returns 0 when the mode is
@@ -806,7 +858,6 @@ static int vga_draw_text_small(VGAState *s,
                                SimpleFBDrawFunc *redraw_func, void *opaque)
 {
     FBDevice *fb_dev = s->fb_dev;
-    static int last_x1 = -1, last_y1 = -1;
 
     int cheight = (s->cr[9] & 0x1f) + 1;
     int width = s->cr[0x01] + 1;
@@ -828,12 +879,17 @@ static int vga_draw_text_small(VGAState *s,
 
     int x1 = (fb_dev->width - width * FONT_SMALL_CW) / 2;
     int y1 = (fb_dev->height - height * FONT_SMALL_CH) / 2;
-    if (x1 != last_x1 || y1 != last_y1) {
+    int w1 = width * FONT_SMALL_CW, h1 = height * FONT_SMALL_CH;
+    if (x1 != s->last_text_x1 || y1 != s->last_text_y1 ||
+        w1 != s->last_text_w1 || h1 != s->last_text_h1) {
         /* geometry changed: clear the margins around the text area once */
         memset(fb_dev->fb_data, 0, fb_dev->height * fb_dev->stride);
-        last_x1 = x1;
-        last_y1 = y1;
+        s->last_text_x1 = x1;
+        s->last_text_y1 = y1;
+        s->last_text_w1 = w1;
+        s->last_text_h1 = h1;
     }
+    set_picture(s, x1, y1, w1, h1);
 
     uint32_t line_offset = s->cr[0x13] << 3;
     uint32_t start_addr = s->cr[0x0d] | (s->cr[0x0c] << 8);
@@ -849,15 +905,15 @@ static int vga_draw_text_small(VGAState *s,
             uint32_t ch_attr = *(uint16_t *)(vga_ram + (ch_addr & 0x1fffe));
             uint32_t cattr = ch_attr >> 8;
             const uint8_t *glyph = font_small[ch_attr & 0xff];
-            uint16_t fg = small_pix(s->last_palette[cattr & 0x0f]);
-            uint16_t bg = small_pix(s->last_palette[(cattr >> 4) & 0x0f]);
+            small_pix_t fg = small_pix(s->last_palette[cattr & 0x0f]);
+            small_pix_t bg = small_pix(s->last_palette[(cattr >> 4) & 0x0f]);
             uint8_t *dst = fb_dev->fb_data +
                 (y1 + cy * FONT_SMALL_CH) * fb_dev->stride +
                 (x1 + cx * FONT_SMALL_CW) * (BPP / 8);
 
             for (int row = 0; row < FONT_SMALL_CH; row++) {
                 uint32_t bits = glyph[row];
-                uint16_t *p = (uint16_t *) (dst + row * fb_dev->stride);
+                small_pix_t *p = (small_pix_t *) (dst + row * fb_dev->stride);
                 p[0] = (bits & 8) ? fg : bg;
                 p[1] = (bits & 4) ? fg : bg;
                 p[2] = (bits & 2) ? fg : bg;
@@ -872,7 +928,7 @@ static int vga_draw_text_small(VGAState *s,
                 if (r1 > FONT_SMALL_CH - 1)
                     r1 = FONT_SMALL_CH - 1;
                 for (int row = r0; row <= r1; row++) {
-                    uint16_t *p = (uint16_t *) (dst + row * fb_dev->stride);
+                    small_pix_t *p = (small_pix_t *) (dst + row * fb_dev->stride);
                     p[0] = p[1] = p[2] = fg;
                 }
             }
@@ -892,8 +948,8 @@ static void vga_text_refresh(VGAState *s,
                              SimpleFBDrawFunc *redraw_func, void *opaque,
                              int full_update)
 {
-#ifdef SMALL_TEXT_FONT
-    if (vga_draw_text_small(s, redraw_func, opaque))
+#ifdef HAVE_SMALL_TEXT
+    if (s->small_text && vga_draw_text_small(s, redraw_func, opaque))
         return;
 #endif
     FBDevice *fb_dev = s->fb_dev;
@@ -1032,6 +1088,7 @@ static void vga_text_refresh(VGAState *s,
         s->last_preset = preset;
         full_update = 1;
     }
+    set_picture(s, x1, y1, width1, height1);
 #endif
     /* taller or shorter cells move every row, even where the number of
        rows stays the same */
@@ -1374,6 +1431,8 @@ static void vga_graphic_refresh(VGAState *s,
     else
         w = wx;
 #endif
+    /* scaled into the frame buffer: the picture is all of it */
+    set_picture(s, 0, 0, fb_dev->width, fb_dev->height);
     int yyt = 0;
     int yy = 0;
 #else
@@ -1387,6 +1446,7 @@ static void vga_graphic_refresh(VGAState *s,
         i0 += (wx - w) / 2 * (BPP / 8);
     else
         w = wx;
+    set_picture(s, (wx - w) / 2, (hx - h) / 2, w, h);
 #endif
     uint32_t plane_mask = s->ar[0x12];
     /* Every pixel of the picture is drawn each time, so all a clear is
@@ -2529,6 +2589,11 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
     fb_dev->stride = width * (BPP / 8);
 #endif
     fb_dev->fb_data = fb;
+    s->pic_w = width;
+    s->pic_h = height;
+#ifdef SMALL_TEXT_FONT
+    s->small_text = 1;
+#endif
 
     s->vga_ram = (uint8_t *) vga_ram;
     s->vga_ram_size = vga_ram_size;

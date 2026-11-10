@@ -4,9 +4,12 @@
  *
  * Display: libdrm, a connected connector in its preferred mode, two dumb
  * buffers flipped with drmModePageFlip (or one buffer and drmModeDirtyFB
- * where page flips are not available).  The guest's frame is centred,
- * scaled by the largest integer factor that fits, or shrunk to fit when the
- * panel is smaller than the guest's frame.
+ * where page flips are not available), XRGB8888 or, where the display only
+ * takes that, RGB565.  What is shown is the guest's picture (the part of
+ * the frame buffer vga.c last drew in), centred and scaled as -scale says:
+ * fit (the default; whole-number factors up, a box filter down), stretch,
+ * or 1:1 with ctrl + alt + arrows to pan.  On small displays text mode can
+ * be drawn with a 4x10 font (-smalltext), so 80x25 fits in 320x250.
  *
  * Input: evdev keyboards and mice from /dev/input/event*, grabbed so that
  * nothing reaches the console underneath.  Linux KEY_* codes are what
@@ -21,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -36,6 +40,7 @@
 #include <linux/vt.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <drm_fourcc.h>
 #include "pc.h"
 #include "osd/osd.h"
 
@@ -78,12 +83,74 @@ int load_rom(void *phys_mem, const char *file, uword addr, int backward)
 	return len;
 }
 
+/* --- options --- */
+
+enum { SCALE_FIT, SCALE_STRETCH, SCALE_NONE };
+
+typedef struct {
+	int scale;              /* SCALE_* */
+	int small_text;         /* -1: when the display is small */
+	int width, height;      /* the guest's frame buffer, 0: from the ini */
+	int bpp;                /* 0: what the display takes */
+	int mode_w, mode_h;     /* 0: the preferred mode */
+	const char *device;     /* NULL: the first with a display */
+} DrmOpts;
+
+static bool parse_scale(const char *v, int *scale)
+{
+	if (strcasecmp(v, "fit") == 0)
+		*scale = SCALE_FIT;
+	else if (strcasecmp(v, "stretch") == 0 || strcasecmp(v, "fill") == 0)
+		*scale = SCALE_STRETCH;
+	else if (strcmp(v, "1:1") == 0 || strcasecmp(v, "none") == 0)
+		*scale = SCALE_NONE;
+	else
+		return false;
+	return true;
+}
+
+static bool parse_size(const char *v, int *w, int *h)
+{
+	return sscanf(v, "%dx%d", w, h) == 2 && *w > 0 && *h > 0;
+}
+
+static int parse_small_text(const char *v)
+{
+	if (strcasecmp(v, "auto") == 0)
+		return -1;
+	return atoi(v) != 0;
+}
+
+/* [drm] in the ini file; other frontends skip the section */
+static int parse_drm_ini(void *user, const char *section,
+			 const char *name, const char *value)
+{
+	DrmOpts *o = user;
+	if (strcmp(section, "drm") != 0)
+		return 1;
+	if (strcmp(name, "scale") == 0) {
+		if (!parse_scale(value, &o->scale))
+			fprintf(stderr, "tiny386_drm: bad scale = %s\n", value);
+	} else if (strcmp(name, "small_text") == 0) {
+		o->small_text = parse_small_text(value);
+	} else if (strcmp(name, "mode") == 0) {
+		if (!parse_size(value, &o->mode_w, &o->mode_h))
+			o->mode_w = o->mode_h = 0;
+	} else if (strcmp(name, "bpp") == 0) {
+		o->bpp = atoi(value);
+	} else if (strcmp(name, "device") == 0) {
+		o->device = strdup(value);
+	}
+	return 1;
+}
+
 /* --- display --- */
 
 typedef struct {
 	uint32_t handle, fb_id, pitch;
 	uint64_t size;
 	uint8_t *map;
+	unsigned gen;           /* the layout it was cleared for */
 } DumbBuf;
 
 #define MAX_INPUTS 32
@@ -95,25 +162,40 @@ typedef struct {
 } InputDev;
 
 typedef struct {
-	int width, height;      /* the guest's frame */
+	int x, y, w, h;
+} Rect;
+
+/* the OSD's window (osd/osd.c), in frame buffer pixels */
+static const Rect osd_rect = { 40, 40, 320, 240 };
+
+typedef struct {
+	int width, height;      /* the guest's frame buffer */
 	uint32_t *fb;
 	PC *pc;
 	OSD *osd;
 	bool osd_enabled;
+	DrmOpts *opts;
 
 	/* DRM */
 	int drm_fd;
 	uint32_t conn_id, crtc_id;
+	int crtc_index;
 	drmModeModeInfo mode;
 	drmModeCrtc *saved_crtc;
+	int bpp;                /* of the dumb buffers: 32 or 16 */
 	DumbBuf buf[2];
 	int nbufs;
 	int front;
 	bool flip_pending;
 	bool dirty;
 	bool active;            /* our VT is shown and we are DRM master */
-	int dst_x, dst_y, dst_w, dst_h;
-	int *xmap;
+
+	/* layout: the source rectangle, where it goes, and lookup tables */
+	Rect src, dst;
+	unsigned gen;
+	int *xs0, *xs1, *ys0, *ys1;
+	bool box;               /* some output pixel covers several sources */
+	int pan_x, pan_y;       /* SCALE_NONE: the picture's pixel at dst's corner */
 
 	/* VT */
 	int tty_fd;
@@ -148,13 +230,14 @@ static bool dumb_create(Console *s, DumbBuf *b)
 	struct drm_mode_create_dumb creq = {0};
 	creq.width = s->mode.hdisplay;
 	creq.height = s->mode.vdisplay;
-	creq.bpp = 32;
+	creq.bpp = s->bpp;
 	if (drmIoctl(s->drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0)
 		return false;
 	b->handle = creq.handle;
 	b->pitch = creq.pitch;
 	b->size = creq.size;
-	if (drmModeAddFB(s->drm_fd, creq.width, creq.height, 24, 32,
+	if (drmModeAddFB(s->drm_fd, creq.width, creq.height,
+			 s->bpp == 16 ? 16 : 24, s->bpp,
 			 b->pitch, b->handle, &b->fb_id)) {
 		struct drm_mode_destroy_dumb dreq = { .handle = b->handle };
 		drmIoctl(s->drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
@@ -173,6 +256,7 @@ static bool dumb_create(Console *s, DumbBuf *b)
 	}
 	b->map = map;
 	memset(b->map, 0, b->size);
+	b->gen = 0;
 	return true;
 }
 
@@ -182,6 +266,14 @@ static void dumb_destroy(Console *s, DumbBuf *b)
 	munmap(b->map, b->size);
 	drmModeRmFB(s->drm_fd, b->fb_id);
 	drmIoctl(s->drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+}
+
+static int crtc_index(drmModeRes *res, uint32_t crtc)
+{
+	for (int j = 0; j < res->count_crtcs; j++)
+		if (res->crtcs[j] == crtc)
+			return j;
+	return -1;
 }
 
 /* the CRTC for a connector: the one it drives now, else a free one */
@@ -213,7 +305,7 @@ static uint32_t find_crtc(int fd, drmModeRes *res, drmModeConnector *conn)
 
 /*
  * Pick a connected connector and a mode on the device at path.  want_w and
- * want_h (from TINY386_DRM_MODE=WxH) choose a mode other than the preferred.
+ * want_h choose a mode other than the preferred.
  */
 static bool drm_try_device(Console *s, const char *path,
 			   int want_w, int want_h)
@@ -243,19 +335,25 @@ static bool drm_try_device(Console *s, const char *path,
 				}
 			}
 			if (want_w > 0) {
-				for (int j = 0; j < conn->count_modes; j++) {
+				int j;
+				for (j = 0; j < conn->count_modes; j++) {
 					if (conn->modes[j].hdisplay == want_w &&
 					    conn->modes[j].vdisplay == want_h) {
 						m = j;
 						break;
 					}
 				}
+				if (j == conn->count_modes)
+					fprintf(stderr, "tiny386_drm: no %dx%d "
+						"mode on %s\n", want_w, want_h,
+						path);
 			}
 			uint32_t crtc = find_crtc(fd, res, conn);
 			if (crtc) {
 				s->drm_fd = fd;
 				s->conn_id = conn->connector_id;
 				s->crtc_id = crtc;
+				s->crtc_index = crtc_index(res, crtc);
 				s->mode = conn->modes[m];
 				found = true;
 			}
@@ -268,67 +366,90 @@ static bool drm_try_device(Console *s, const char *path,
 	return found;
 }
 
-static void drm_layout(Console *s)
+/*
+ * 32 bpp (XRGB8888) unless the CRTC's primary plane does not take it but
+ * takes RGB565, as some small SPI panels (panel-mipi-dbi and the like).
+ */
+static int drm_pick_bpp(Console *s)
 {
-	int pw = s->mode.hdisplay, ph = s->mode.vdisplay;
-	int k = pw / s->width < ph / s->height ? pw / s->width : ph / s->height;
-	if (k >= 1) {
-		s->dst_w = s->width * k;
-		s->dst_h = s->height * k;
-	} else {
-		/* the panel is smaller than the guest's frame: shrink to fit */
-		if ((long) pw * s->height <= (long) ph * s->width) {
-			s->dst_w = pw;
-			s->dst_h = (long) s->height * pw / s->width;
-		} else {
-			s->dst_h = ph;
-			s->dst_w = (long) s->width * ph / s->height;
+	bool xrgb = false, rgb565 = false, seen = false;
+	drmSetClientCap(s->drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+	drmModePlaneRes *pr = drmModeGetPlaneResources(s->drm_fd);
+	for (uint32_t i = 0; pr && i < pr->count_planes; i++) {
+		drmModePlane *p = drmModeGetPlane(s->drm_fd, pr->planes[i]);
+		if (!p)
+			continue;
+		bool primary = false;
+		drmModeObjectProperties *props = drmModeObjectGetProperties(
+			s->drm_fd, p->plane_id, DRM_MODE_OBJECT_PLANE);
+		for (uint32_t j = 0; props && j < props->count_props; j++) {
+			drmModePropertyRes *prop =
+				drmModeGetProperty(s->drm_fd, props->props[j]);
+			if (prop && strcmp(prop->name, "type") == 0 &&
+			    props->prop_values[j] == DRM_PLANE_TYPE_PRIMARY)
+				primary = true;
+			drmModeFreeProperty(prop);
 		}
-		if (s->dst_w < 1) s->dst_w = 1;
-		if (s->dst_h < 1) s->dst_h = 1;
+		drmModeFreeObjectProperties(props);
+		if (primary && s->crtc_index >= 0 &&
+		    (p->possible_crtcs & (1u << s->crtc_index))) {
+			seen = true;
+			for (uint32_t j = 0; j < p->count_formats; j++) {
+				if (p->formats[j] == DRM_FORMAT_XRGB8888)
+					xrgb = true;
+				if (p->formats[j] == DRM_FORMAT_RGB565)
+					rgb565 = true;
+			}
+		}
+		drmModeFreePlane(p);
 	}
-	s->dst_x = (pw - s->dst_w) / 2;
-	s->dst_y = (ph - s->dst_h) / 2;
-	s->xmap = malloc(sizeof(int) * s->dst_w);
-	for (int x = 0; x < s->dst_w; x++)
-		s->xmap[x] = (long) x * s->width / s->dst_w;
+	drmModeFreePlaneResources(pr);
+	drmSetClientCap(s->drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 0);
+	if (seen && !xrgb && rgb565)
+		return 16;
+	return 32;
 }
 
 static void drm_init(Console *s)
 {
-	int want_w = 0, want_h = 0;
-	const char *m = getenv("TINY386_DRM_MODE");
-	if (m && sscanf(m, "%dx%d", &want_w, &want_h) != 2)
-		want_w = want_h = 0;
-
-	const char *dev = getenv("TINY386_DRM_DEVICE");
+	DrmOpts *o = s->opts;
 	bool ok = false;
-	if (dev) {
-		ok = drm_try_device(s, dev, want_w, want_h);
+	if (o->device) {
+		ok = drm_try_device(s, o->device, o->mode_w, o->mode_h);
 	} else {
 		for (int i = 0; i < 16 && !ok; i++) {
 			char path[32];
 			snprintf(path, sizeof(path), "/dev/dri/card%d", i);
-			ok = drm_try_device(s, path, want_w, want_h);
+			ok = drm_try_device(s, path, o->mode_w, o->mode_h);
 		}
 	}
 	if (!ok)
 		die("no DRM device with a connected display "
 		    "(set TINY386_DRM_DEVICE=/dev/dri/cardN?)");
 
-	if (drmSetMaster(s->drm_fd) < 0 && errno != EINVAL)
+	if (drmSetMaster(s->drm_fd) < 0)
 		fprintf(stderr, "tiny386_drm: drmSetMaster: %s "
 			"(is a display server running on this device?)\n",
 			strerror(errno));
 
 	s->saved_crtc = drmModeGetCrtc(s->drm_fd, s->crtc_id);
 
+	s->bpp = o->bpp == 16 || o->bpp == 32 ? o->bpp : drm_pick_bpp(s);
 	s->nbufs = 0;
 	for (int i = 0; i < 2; i++)
 		if (dumb_create(s, &s->buf[i]))
 			s->nbufs++;
 		else
 			break;
+	if (s->nbufs == 0 && s->bpp == 32 && !o->bpp) {
+		/* some drivers still want 16 bpp */
+		s->bpp = 16;
+		for (int i = 0; i < 2; i++)
+			if (dumb_create(s, &s->buf[i]))
+				s->nbufs++;
+			else
+				break;
+	}
 	if (s->nbufs == 0)
 		die("cannot create a dumb buffer");
 	s->front = 0;
@@ -339,34 +460,189 @@ static void drm_init(Console *s)
 		exit(1);
 	}
 	s->active = true;
-	drm_layout(s);
-	fprintf(stderr, "tiny386_drm: %dx%d@%d, guest %dx%d drawn as %dx%d, "
-		"%d buffer%s\n",
-		s->mode.hdisplay, s->mode.vdisplay, s->mode.vrefresh,
-		s->width, s->height, s->dst_w, s->dst_h,
+	s->gen = 1;
+	fprintf(stderr, "tiny386_drm: %dx%d@%d %d bpp, %d buffer%s\n",
+		s->mode.hdisplay, s->mode.vdisplay, s->mode.vrefresh, s->bpp,
 		s->nbufs, s->nbufs > 1 ? "s" : "");
 }
 
+static Rect rect_clip(Rect r, int w, int h)
+{
+	if (r.x < 0) { r.w += r.x; r.x = 0; }
+	if (r.y < 0) { r.h += r.y; r.y = 0; }
+	if (r.w > w - r.x) r.w = w - r.x;
+	if (r.h > h - r.y) r.h = h - r.y;
+	if (r.w <= 0 || r.h <= 0)
+		r = (Rect) { 0, 0, w, h };
+	return r;
+}
+
+/* what to show: the guest's picture, or the OSD over it */
+static Rect source_rect(Console *s)
+{
+	int pw = s->mode.hdisplay, ph = s->mode.vdisplay;
+	Rect r;
+	if (s->osd_enabled) {
+		/* the whole frame if it is shown 1:1 or bigger, else the
+		   OSD's window, so that it stays readable */
+		if (s->width <= pw && s->height <= ph)
+			r = (Rect) { 0, 0, s->width, s->height };
+		else
+			r = rect_clip(osd_rect, s->width, s->height);
+	} else {
+		vga_get_picture(s->pc->vga, &r.x, &r.y, &r.w, &r.h);
+		r = rect_clip(r, s->width, s->height);
+	}
+	if (s->opts->scale == SCALE_NONE && (r.w > pw || r.h > ph)) {
+		/* a window on the picture, where it has been panned to */
+		int maxx = r.w > pw ? r.w - pw : 0;
+		int maxy = r.h > ph ? r.h - ph : 0;
+		if (s->pan_x > maxx) s->pan_x = maxx;
+		if (s->pan_y > maxy) s->pan_y = maxy;
+		if (s->pan_x < 0) s->pan_x = 0;
+		if (s->pan_y < 0) s->pan_y = 0;
+		r.x += s->pan_x;
+		r.y += s->pan_y;
+		if (r.w > pw) r.w = pw;
+		if (r.h > ph) r.h = ph;
+	}
+	return r;
+}
+
+static void make_map(int *s0, int *s1, int n, int src_off, int src_n)
+{
+	for (int i = 0; i < n; i++) {
+		int a = (long) i * src_n / n;
+		int b = (long) (i + 1) * src_n / n;
+		if (b <= a)
+			b = a + 1;
+		s0[i] = src_off + a;
+		s1[i] = src_off + b;
+	}
+}
+
+static void layout(Console *s, Rect src)
+{
+	int pw = s->mode.hdisplay, ph = s->mode.vdisplay;
+	Rect dst;
+	if (s->opts->scale == SCALE_STRETCH) {
+		dst = (Rect) { 0, 0, pw, ph };
+	} else if (s->opts->scale == SCALE_NONE) {
+		dst.w = src.w;
+		dst.h = src.h;
+	} else {
+		int k = pw / src.w < ph / src.h ? pw / src.w : ph / src.h;
+		if (k >= 1) {
+			dst.w = src.w * k;
+			dst.h = src.h * k;
+		} else if ((long) pw * src.h <= (long) ph * src.w) {
+			dst.w = pw;
+			dst.h = (long) src.h * pw / src.w;
+		} else {
+			dst.h = ph;
+			dst.w = (long) src.w * ph / src.h;
+		}
+		if (dst.w < 1) dst.w = 1;
+		if (dst.h < 1) dst.h = 1;
+	}
+	dst.x = (pw - dst.w) / 2;
+	dst.y = (ph - dst.h) / 2;
+
+	if (s->xs0 && memcmp(&src, &s->src, sizeof(src)) == 0 &&
+	    memcmp(&dst, &s->dst, sizeof(dst)) == 0)
+		return;
+	bool moved = !s->xs0 || memcmp(&dst, &s->dst, sizeof(dst)) != 0;
+	s->src = src;
+	s->dst = dst;
+	free(s->xs0); free(s->xs1); free(s->ys0); free(s->ys1);
+	s->xs0 = malloc(sizeof(int) * dst.w);
+	s->xs1 = malloc(sizeof(int) * dst.w);
+	s->ys0 = malloc(sizeof(int) * dst.h);
+	s->ys1 = malloc(sizeof(int) * dst.h);
+	make_map(s->xs0, s->xs1, dst.w, src.x, src.w);
+	make_map(s->ys0, s->ys1, dst.h, src.y, src.h);
+	s->box = src.w > dst.w || src.h > dst.h;
+	if (moved)
+		s->gen++;   /* the borders change: clear the buffers */
+}
+
+static inline uint16_t to565(uint32_t c)
+{
+	return ((c >> 8) & 0xf800) | ((c >> 5) & 0x07e0) | ((c >> 3) & 0x001f);
+}
+
+static void put_row(Console *s, uint8_t *row, const uint32_t *px, int n)
+{
+	if (s->bpp == 32) {
+		memcpy(row, px, n * 4);
+	} else {
+		uint16_t *d = (uint16_t *) row;
+		for (int x = 0; x < n; x++)
+			d[x] = to565(px[x]);
+	}
+}
+
+/*
+ * Each output pixel is the average of the source pixels it covers
+ * [xs0, xs1) x [ys0, ys1): a box filter going down, nearest going up.
+ */
 static void blit(Console *s, DumbBuf *b)
 {
+	if (b->gen != s->gen) {
+		memset(b->map, 0, b->size);
+		b->gen = s->gen;
+	}
 	const uint32_t *src = s->fb;
-	uint8_t *row0 = b->map + (size_t) s->dst_y * b->pitch + s->dst_x * 4;
-	int last_sy = -1;
+	int sw = s->width;
+	int dw = s->dst.w;
+	int bypp = s->bpp / 8;
+	uint8_t *row0 = b->map + (size_t) s->dst.y * b->pitch + s->dst.x * bypp;
+	static uint32_t *line;
+	static int line_n;
+	if (line_n < dw) {
+		free(line);
+		line = malloc(sizeof(uint32_t) * dw);
+		line_n = dw;
+	}
+	int last_y0 = -1, last_y1 = -1;
 	uint8_t *last_row = NULL;
-	for (int y = 0; y < s->dst_h; y++) {
+	for (int y = 0; y < s->dst.h; y++) {
 		uint8_t *row = row0 + (size_t) y * b->pitch;
-		int sy = (long) y * s->height / s->dst_h;
-		if (sy == last_sy) {
-			memcpy(row, last_row, s->dst_w * 4);
-		} else if (s->dst_w == s->width) {
-			memcpy(row, src + (size_t) sy * s->width, s->width * 4);
-		} else {
-			const uint32_t *sl = src + (size_t) sy * s->width;
-			uint32_t *d = (uint32_t *) row;
-			for (int x = 0; x < s->dst_w; x++)
-				d[x] = sl[s->xmap[x]];
+		int y0 = s->ys0[y], y1 = s->ys1[y];
+		if (y0 == last_y0 && y1 == last_y1) {
+			memcpy(row, last_row, dw * bypp);
+			continue;
 		}
-		last_sy = sy;
+		if (!s->box) {
+			const uint32_t *sl = src + (size_t) y0 * sw;
+			if (dw == s->src.w) {
+				put_row(s, row, sl + s->src.x, dw);
+			} else {
+				for (int x = 0; x < dw; x++)
+					line[x] = sl[s->xs0[x]];
+				put_row(s, row, line, dw);
+			}
+		} else {
+			for (int x = 0; x < dw; x++) {
+				uint32_t r = 0, g = 0, bl = 0, n = 0;
+				int x0 = s->xs0[x], x1 = s->xs1[x];
+				for (int yy = y0; yy < y1; yy++) {
+					const uint32_t *p = src + (size_t) yy * sw;
+					for (int xx = x0; xx < x1; xx++) {
+						uint32_t c = p[xx];
+						r += (c >> 16) & 0xff;
+						g += (c >> 8) & 0xff;
+						bl += c & 0xff;
+					}
+					n += x1 - x0;
+				}
+				line[x] = ((r / n) << 16) | ((g / n) << 8) |
+					  (bl / n);
+			}
+			put_row(s, row, line, dw);
+		}
+		last_y0 = y0;
+		last_y1 = y1;
 		last_row = row;
 	}
 }
@@ -381,6 +657,7 @@ static void present(Console *s)
 		return;
 	}
 	s->dirty = false;
+	layout(s, source_rect(s));
 	if (s->nbufs > 1) {
 		int back = s->front ^ 1;
 		blit(s, &s->buf[back]);
@@ -402,8 +679,7 @@ static void present(Console *s)
 	}
 	DumbBuf *b = &s->buf[s->front];
 	blit(s, b);
-	drmModeClip clip = { s->dst_x, s->dst_y,
-			     s->dst_x + s->dst_w, s->dst_y + s->dst_h };
+	drmModeClip clip = { 0, 0, s->mode.hdisplay, s->mode.vdisplay };
 	drmModeDirtyFB(s->drm_fd, b->fb_id, &clip, 1);
 }
 
@@ -576,6 +852,21 @@ void console_send_kbd(void *opaque, int keypress, int keycode)
 	ps2_put_keycode(s->pc->kbd, keypress, keycode);
 }
 
+static void toggle_osd(Console *s)
+{
+	s->osd_enabled = !s->osd_enabled;
+	osd_attach_emulink(s->osd, s->pc->emulink);
+	osd_attach_ide(s->osd, s->pc->ide, s->pc->ide2);
+	s->pc->full_update = s->osd_enabled ? 1 : 2;
+	if (s->osd_enabled) {
+		/* the pointer starts in the middle of the OSD's window */
+		Rect r = rect_clip(osd_rect, s->width, s->height);
+		s->mx = r.x + r.w / 2;
+		s->my = r.y + r.h / 2;
+	}
+	present(s);
+}
+
 static void handle_key(Console *s, int code, int value)
 {
 	bool down = value != 0;   /* 2 is autorepeat: a make code again */
@@ -587,16 +878,30 @@ static void handle_key(Console *s, int code, int value)
 	if (!down && !key_pressed[code])
 		return;   /* released a key we did not see go down */
 
+	if (down && ctrl && alt && s->opts->scale == SCALE_NONE) {
+		/* pan the 1:1 picture by a quarter of the display */
+		int dx = 0, dy = 0;
+		switch (code) {
+		case KEY_LEFT: dx = -1; break;
+		case KEY_RIGHT: dx = 1; break;
+		case KEY_UP: dy = -1; break;
+		case KEY_DOWN: dy = 1; break;
+		}
+		if (dx || dy) {
+			s->pan_x += dx * (s->mode.hdisplay / 4);
+			s->pan_y += dy * (s->mode.vdisplay / 4);
+			present(s);
+			return;
+		}
+	}
+
 	if (down && value == 1) {
 		if (code == KEY_RIGHTBRACE && ctrl) {
 			g_running = 0;
 			return;
 		}
 		if (code == KEY_LEFTBRACE && ctrl) {
-			s->osd_enabled = !s->osd_enabled;
-			osd_attach_emulink(s->osd, s->pc->emulink);
-			osd_attach_ide(s->osd, s->pc->ide, s->pc->ide2);
-			s->pc->full_update = s->osd_enabled ? 1 : 2;
+			toggle_osd(s);
 			return;
 		}
 		if (ctrl && alt && s->vt_process) {
@@ -645,12 +950,15 @@ static void flush_rel(Console *s)
 	if (!s->rel_pending)
 		return;
 	if (s->osd_enabled) {
+		/* the pointer moves in frame buffer pixels, kept to what is
+		   on the display */
+		Rect r = s->xs0 ? s->src : (Rect) { 0, 0, s->width, s->height };
 		s->mx += s->rel_x;
 		s->my += s->rel_y;
-		if (s->mx < 0) s->mx = 0;
-		if (s->my < 0) s->my = 0;
-		if (s->mx >= s->width) s->mx = s->width - 1;
-		if (s->my >= s->height) s->my = s->height - 1;
+		if (s->mx < r.x) s->mx = r.x;
+		if (s->my < r.y) s->my = r.y;
+		if (s->mx >= r.x + r.w) s->mx = r.x + r.w - 1;
+		if (s->my >= r.y + r.h) s->my = r.y + r.h - 1;
 		if (s->rel_x || s->rel_y)
 			osd_handle_mouse_motion(s->osd, s->mx, s->my);
 	} else {
@@ -822,17 +1130,14 @@ static void sig_handler(int sig)
 	g_running = 0;
 }
 
-Console *console_init(int width, int height)
+/* the display, opened before the guest's frame buffer is sized */
+Console *console_init(DrmOpts *opts)
 {
 	Console *s = calloc(1, sizeof(Console));
+	s->opts = opts;
 	s->osd = osd_init();
 	s->osd_enabled = false;
-	s->width = width;
-	s->height = height;
-	s->fb = bigmalloc(s->width * s->height * 4);
 	s->tty_fd = -1;
-	s->mx = width / 2;
-	s->my = height / 2;
 
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
@@ -841,6 +1146,16 @@ Console *console_init(int width, int height)
 	drm_init(s);
 	g_console = s;
 	atexit(cleanup);
+	return s;
+}
+
+void console_start(Console *s, int width, int height)
+{
+	s->width = width;
+	s->height = height;
+	s->fb = bigmalloc(s->width * s->height * 4);
+	s->mx = width / 2;
+	s->my = height / 2;
 	vt_init(s);
 	input_scan(s);
 	if (s->nin == 0)
@@ -848,7 +1163,6 @@ Console *console_init(int width, int height)
 			"/dev/input (are you in the input group?)\n");
 	input_try_grab(s);
 	osd_attach_console(s->osd, s);
-	return s;
 }
 
 static void console_poll(Console *s)
@@ -903,12 +1217,30 @@ static void setup_audio(PC *pc)
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"Usage: %s [-kvm] inifile\n"
+		"Usage: %s [options] inifile\n"
 		"Runs full-screen on a Linux console with KMS/DRM.\n"
+		"  -kvm                 run with KVM (USE_CPUABS=y builds)\n"
+		"  -scale fit|stretch|1:1\n"
+		"                       fit: keep the aspect, whole factors up and "
+		"a box filter down\n"
+		"                       (default); stretch: fill the display; "
+		"1:1: no scaling,\n"
+		"                       ctrl + alt + arrows pan a picture bigger "
+		"than the display\n"
+		"  -smalltext, -nosmalltext\n"
+		"                       text mode with a 4x10 font, 80x25 in "
+		"320x250 (default: when\n"
+		"                       the display is smaller than 640x400)\n"
+		"  -size WxH            the guest's frame buffer ([display] "
+		"width/height)\n"
+		"  -mode WxH            a display mode other than the preferred\n"
+		"The ini file's [drm] section takes scale, small_text "
+		"(0/1/auto), mode, bpp\n"
+		"(16/32) and device; the environment TINY386_DRM_DEVICE, "
+		"TINY386_DRM_MODE\n"
+		"and TINY386_DRM_BPP.\n"
 		"ctrl + ] quits, ctrl + [ shows/hides the OSD, "
-		"ctrl + alt + Fn switches VT.\n"
-		"Environment: TINY386_DRM_DEVICE=/dev/dri/cardN, "
-		"TINY386_DRM_MODE=WxH\n",
+		"ctrl + alt + Fn switches VT.\n",
 		argv0);
 }
 
@@ -923,14 +1255,31 @@ int main(int argc, char *argv[])
 	conf.cpu_gen = 4;
 	conf.fpu = 0;
 
+	DrmOpts opts = { .scale = SCALE_FIT, .small_text = -1 };
+	DrmOpts cli = { .scale = -1, .small_text = -2 };
 	bool enable_kvm = false;
 	if (argc < 2) {
 		usage(argv[0]);
 		return 1;
 	}
 	for (int i = 1; i < argc - 1; i++) {
-		if (strcmp(argv[i], "-kvm") == 0) {
+		const char *a = argv[i];
+		const char *v = i + 1 < argc - 1 ? argv[i + 1] : NULL;
+		if (strcmp(a, "-kvm") == 0) {
 			enable_kvm = true;
+		} else if (strcmp(a, "-smalltext") == 0) {
+			cli.small_text = 1;
+		} else if (strcmp(a, "-nosmalltext") == 0) {
+			cli.small_text = 0;
+		} else if (strcmp(a, "-scale") == 0 && v &&
+			   parse_scale(v, &cli.scale)) {
+			i++;
+		} else if (strcmp(a, "-size") == 0 && v &&
+			   parse_size(v, &cli.width, &cli.height)) {
+			i++;
+		} else if (strcmp(a, "-mode") == 0 && v &&
+			   parse_size(v, &cli.mode_w, &cli.mode_h)) {
+			i++;
 		} else {
 			usage(argv[0]);
 			return 1;
@@ -944,12 +1293,45 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "error %d\n", err);
 		return err;
 	}
+	ini_parse(argv1, parse_drm_ini, &opts);
 	if (enable_kvm)
 		conf.cpu_gen = -1;
 
-	Console *console = console_init(conf.width, conf.height);
+	/* the command line, then the environment, over the ini file */
+	const char *e;
+	if ((e = getenv("TINY386_DRM_DEVICE")))
+		opts.device = e;
+	if ((e = getenv("TINY386_DRM_MODE")) &&
+	    !parse_size(e, &opts.mode_w, &opts.mode_h))
+		opts.mode_w = opts.mode_h = 0;
+	if ((e = getenv("TINY386_DRM_BPP")))
+		opts.bpp = atoi(e);
+	if (cli.scale >= 0)
+		opts.scale = cli.scale;
+	if (cli.small_text >= -1)
+		opts.small_text = cli.small_text;
+	if (cli.mode_w) {
+		opts.mode_w = cli.mode_w;
+		opts.mode_h = cli.mode_h;
+	}
+	if (cli.width) {
+		conf.width = cli.width;
+		conf.height = cli.height;
+	}
+
+	Console *console = console_init(&opts);
+	console_start(console, conf.width, conf.height);
 	PC *pc = pc_new(redraw, console, (u8 *) console->fb, &conf);
 	console->pc = pc;
+
+	int small = opts.small_text;
+	if (small < 0)
+		small = console->mode.hdisplay < 640 ||
+			console->mode.vdisplay < 400;
+	vga_set_small_text(pc->vga, small);
+	if (small)
+		fprintf(stderr, "tiny386_drm: text mode with the small font\n");
+
 	setup_audio(pc);
 	load_bios_and_reset(pc);
 
