@@ -50,6 +50,29 @@ Options (`CFLAGS`):
 
 Pre-built binaries: [here](https://github.com/hchunhui/tiny386/releases)
 
+### Luckfox Lyra (musl Linux)
+
+The Luckfox Lyra (Rockchip RK3506, Cortex-A7) running musl Linux is this fork's default Linux target. `make PLAT=lyra` cross-builds `tiny386_drm` (the console frontend, see [Linux console (KMS/DRM)](#linux-console-kmsdrm)) and `tiny386_headless` for it, with `-mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard`:
+
+```sh
+make PLAT=lyra HOSTCC=gcc prepare     # fmopl.inc, generated on the build machine
+make PLAT=lyra CROSS_COMPILE=arm-buildroot-linux-musleabihf- SYSROOT=/path/to/sysroot
+```
+
+- `CROSS_COMPILE`: the toolchain prefix, default `arm-linux-musleabihf-`. A Buildroot SDK's prefix is usually `arm-buildroot-linux-musleabihf-`.
+- `SYSROOT`: passed as `--sysroot`. `tiny386_drm` needs libdrm in it. ALSA headers there turn on sound (`DRM_AUDIO`). Set `PKG_CONFIG` to the sysroot's pkg-config if it has one; the build machine's is not used.
+- `LYRA_STATIC=y`: link statically, which needs static libraries (e.g. `libdrm.a` for `tiny386_drm`).
+- `USE_SLIRP` is `n` by default here, as a musl sysroot seldom has libslirp (set `USE_SLIRP=y` if yours does). TUN/TAP networking still works.
+- `USE_FAST` and `USE_FASTMEM` stay off by default; use `scripts/lyra-bench.sh` to find what helps on the board.
+- With zig as the compiler, use `CC="zig cc -target arm-linux-musleabihf" LYRA_ARCH="-mcpu=cortex_a7 -mfpu=neon-vfpv4 -mfloat-abi=hard" LYRA_STATIC=y`. zig ships musl, so no sysroot is needed for `tiny386_headless`.
+
+To compare the CPU options on the board, build every variant on the build machine (any `make` variables above can follow `build`), copy `build/lyra-bench/` to the board, and run the script there. It prints a table of Mips per `-bench` row. No BIOS is needed.
+
+```sh
+scripts/lyra-bench.sh build CROSS_COMPILE=arm-buildroot-linux-musleabihf-
+scp -r build/lyra-bench root@lyra:/tmp/ && ssh root@lyra sh /tmp/lyra-bench/lyra-bench.sh run
+```
+
 ## Usage
 
 - Prepare an ini file
