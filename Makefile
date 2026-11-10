@@ -54,6 +54,15 @@ LIBS_RAWDRAW = ${LIBS_RAWDRAW_${PLAT}}
 #USE_SDL = y/n
 USE_SDL = n
 
+# tiny386_drm (not built by default): KMS/DRM frontend for the Linux console
+PKG_CONFIG = pkg-config
+CFLAGS_DRM = `${PKG_CONFIG} --cflags libdrm 2>/dev/null || echo -I/usr/include/libdrm`
+LIBS_DRM = `${PKG_CONFIG} --libs libdrm 2>/dev/null || echo -ldrm`
+#DRM_AUDIO = y/n: tiny386_drm sound through rawdraw's CNFA (needs ALSA headers to build; libasound is loaded at run time)
+DRM_AUDIO = $(shell test -e /usr/include/alsa/asoundlib.h && echo y || echo n)
+CFLAGS_DRM_AUDIO_y = -DDRM_AUDIO
+LIBS_DRM_AUDIO_y = -ldl -lpthread
+
 #USE_FMOPL = y/n/nuked_opl3
 USE_FMOPL = y
 FMOPL_y = fmopl.c
@@ -169,7 +178,7 @@ win32:
 	make -C . PLAT=win32
 
 clean:
-	rm -f ${OBJS} i386.o fast/fast.o .fast-* amd64.o fpu.o amd64-comb.o i386-comb.o fpu-leg32.o i386-leg32.o .depends ${PROGS}
+	rm -f ${OBJS} i386.o fast/fast.o .fast-* amd64.o fpu.o amd64-comb.o i386-comb.o fpu-leg32.o i386-leg32.o .depends ${PROGS} tiny386_drm
 
 show:
 	@echo CC = ${CC}
@@ -220,6 +229,10 @@ tiny386${SUFF_SDL}: sdl/main.c ${OBJS}
 tiny386${SUFF_RAWDRAW}: rawdraw/main.c ${OBJS}
 	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
 	${Q}${CC} ${LDFLAGS} ${CFLAGS} -o $@ $^$> ${LIBS_RAWDRAW}
+
+tiny386_drm: drm/main.c ${OBJS}
+	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
+	${Q}${CC} ${LDFLAGS} ${CFLAGS} ${CFLAGS_DRM} ${CFLAGS_DRM_AUDIO_${DRM_AUDIO}} -o $@ $^$> ${LIBS_DRM} ${LIBS_DRM_AUDIO_${DRM_AUDIO}} ${LIBS}
 
 tiny386_headless: main.c ${OBJS}
 	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"

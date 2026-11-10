@@ -96,6 +96,24 @@ fpu = 0
 For rawdraw and SDL port:
 Press "Ctrl + ]" to grab/ungrab the keyboard and mouse. Press "Ctrl + [" to show/hide OSD (On Screen Display). In OSD mode, the floppy/CD-ROM disk can be changed on the fly.
 
+### Linux console (KMS/DRM)
+`tiny386_drm` runs full-screen straight from a Linux text console (VT), with no X11, Wayland or SDL. It is not built by default:
+```sh
+sudo apt install libdrm-dev   # pkg-config is optional
+make tiny386_drm              # sound if the ALSA headers are installed; DRM_AUDIO=n to leave it out
+```
+It needs only libdrm. With `DRM_AUDIO=y` (the default when `/usr/include/alsa/asoundlib.h` exists) it plays sound through rawdraw's CNFA, which loads `libasound` at run time.
+
+Run it from a VT (e.g. ctrl + alt + F3, log in), not from a terminal in a desktop session:
+```sh
+./tiny386_drm config.ini >/dev/null   # the guest's BIOS debug output goes to stdout
+```
+- Permissions: the DRM device (`/dev/dri/card*`) needs the `video` group, and the keyboard and mouse (`/dev/input/event*`) the `input` group (`sudo usermod -aG video,input $USER`, then log in again), or run it as root. No display server may be running on the same GPU, since tiny386_drm has to become the DRM master.
+- The guest's screen is centred and scaled by the largest whole factor that fits, or shrunk to fit if the display is smaller than `[display]` in the ini file.
+- Keyboards and mice are grabbed, so keys do not reach the console underneath. Ctrl + ] quits, ctrl + [ shows/hides the OSD, ctrl + alt + F1..F12 switches VT (the display and input are given back while another VT is shown). On exit, including SIGINT/SIGTERM, the console's previous mode is restored.
+- Environment: `TINY386_DRM_DEVICE=/dev/dri/card1` picks the device (default: the first with a connected display), `TINY386_DRM_MODE=1024x768` a display mode other than the preferred one.
+- Only relative mice are supported: touchpads and tablets that report absolute positions are not used.
+
 ## ESP32 port
 Supported boards:
 
