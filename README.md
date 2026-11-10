@@ -109,9 +109,25 @@ Run it from a VT (e.g. ctrl + alt + F3, log in), not from a terminal in a deskto
 ./tiny386_drm config.ini >/dev/null   # the guest's BIOS debug output goes to stdout
 ```
 - Permissions: the DRM device (`/dev/dri/card*`) needs the `video` group, and the keyboard and mouse (`/dev/input/event*`) the `input` group (`sudo usermod -aG video,input $USER`, then log in again), or run it as root. No display server may be running on the same GPU, since tiny386_drm has to become the DRM master.
-- The guest's screen is centred and scaled by the largest whole factor that fits, or shrunk to fit if the display is smaller than `[display]` in the ini file.
+- What is shown is the guest's picture: the part of the `[display]` frame buffer the current video mode is drawn in (e.g. 640x480 out of 720x480), centred on the display. `-scale` chooses how it is scaled:
+  - `fit` (the default): keeps the aspect ratio, scales up by the largest whole factor that fits, and shrinks with a box filter (each pixel averages the pixels it covers) when the picture is bigger than the display. A 640x480 graphics mode becomes 320x240 on a 320x320 panel, as `SCALE_2_1` does on the PicoCalc.
+  - `stretch`: fills the whole display.
+  - `1:1`: no scaling. A picture bigger than the display is cut, and ctrl + alt + arrows pan it by a quarter of the display.
+- Small displays: 80x25 text mode with 8x16 or 9x16 glyphs shrunk to 320 pixels is soft. `-smalltext` draws text mode with the PicoCalc port's 4x10 font instead, so 80x25 is 320x250, shown 1:1 and sharp. It is on by default when the display is smaller than 640x400 (`-nosmalltext` to switch it off). Graphics modes are still shrunk.
+- `-size WxH` overrides `[display]` (the guest's frame buffer), and `-mode WxH` picks a display mode other than the preferred one.
+- The same settings can go in the ini file, which the other frontends ignore:
+  ```ini
+  [drm]
+  scale = fit          ; fit, stretch or 1:1
+  small_text = auto    ; auto, 1 or 0
+  mode = 320x320       ; a display mode other than the preferred
+  bpp = 16             ; force 16 (RGB565) or 32 (XRGB8888) bpp buffers
+  device = /dev/dri/card1
+  ```
+- 32 bpp buffers (XRGB8888) are used unless the display's primary plane only takes RGB565, as some small SPI panels do (`panel-mipi-dbi` and other tinydrm drivers). In that case the frame is converted to 16 bpp.
+- The OSD (ctrl + [) is shown with the whole frame buffer when that fits on the display at 1:1. Otherwise only its window (320x240) is shown, so it stays readable on a 320x320 panel. Its pointer moves in frame buffer pixels.
 - Keyboards and mice are grabbed, so keys do not reach the console underneath. Ctrl + ] quits, ctrl + [ shows/hides the OSD, ctrl + alt + F1..F12 switches VT (the display and input are given back while another VT is shown). On exit, including SIGINT/SIGTERM, the console's previous mode is restored.
-- Environment: `TINY386_DRM_DEVICE=/dev/dri/card1` picks the device (default: the first with a connected display), `TINY386_DRM_MODE=1024x768` a display mode other than the preferred one.
+- Environment: `TINY386_DRM_DEVICE=/dev/dri/card1` picks the device (default: the first with a connected display), `TINY386_DRM_MODE=1024x768` a display mode, `TINY386_DRM_BPP=16` the buffers' depth. These override the ini file; the command line overrides both.
 - Only relative mice are supported: touchpads and tablets that report absolute positions are not used.
 
 ## ESP32 port
