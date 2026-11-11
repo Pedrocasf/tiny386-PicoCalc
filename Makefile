@@ -1,14 +1,27 @@
 Q = @
+# PLAT = (empty: native build) / win32 / lyra
+# lyra: cross-build for the Luckfox Lyra (Rockchip RK3506, Cortex-A7) running
+# musl Linux, e.g. make PLAT=lyra CROSS_COMPILE=arm-buildroot-linux-musleabihf-
+# SYSROOT=/path/to/sysroot; see README.md
+CROSS_COMPILE = arm-linux-musleabihf-
+SYSROOT =
 CC_ = gcc
 CC_win32 = i686-w64-mingw32-gcc
+CC_lyra = ${CROSS_COMPILE}gcc
 CC = ${CC_${PLAT}}
 LD_ = ld
 LD_win32 = i686-w64-mingw32-ld
+LD_lyra = ${CROSS_COMPILE}ld
 LD = ${LD_${PLAT}}
 OBJCOPY_ = objcopy
 OBJCOPY_win32 = i686-w64-mingw32-objcopy
+OBJCOPY_lyra = ${CROSS_COMPILE}objcopy
 OBJCOPY = ${OBJCOPY_${PLAT}}
-HOSTCC = ${CC}
+# the compiler for tools that run on the build machine (fmopl.inc's generator)
+HOSTCC_ = ${CC}
+HOSTCC_win32 = ${CC}
+HOSTCC_lyra = cc
+HOSTCC = ${HOSTCC_${PLAT}}
 
 SDL_CONFIG = sdl-config
 SLIRP_INC =
@@ -16,6 +29,11 @@ SLIRP_LIB = -lslirp
 
 CFLAGS_ = -I . -Wall -O3 -ffunction-sections -fdata-sections -g -Wl,--gc-sections
 CFLAGS_win32 = -I . -Wall -O3 -ffunction-sections -g -Wl,--gc-sections
+# Cortex-A7: ARMv7-A, NEON and VFPv4, hard-float ABI
+LYRA_ARCH = -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
+SYSROOT_FLAGS = $(if ${SYSROOT},--sysroot=${SYSROOT})
+# (--gc-sections is a link flag here: some cross compilers, zig cc among them, act on it under -c too)
+CFLAGS_lyra = -I . -Wall -O3 -ffunction-sections -fdata-sections -g ${LYRA_ARCH} ${SYSROOT_FLAGS}
 CFLAGS = ${CFLAGS_${PLAT}}
 CFLAGS += -DI386_ENABLE_FPU
 CFLAGS += -DI386_ENABLE_MMX -DI386_ENABLE_SSE -DI386_ENABLE_SSE2 -DI386_ENABLE_SSE3
@@ -24,6 +42,9 @@ CFLAGS_SDL = ${CFLAGS} `${SDL_CONFIG} --cflags`
 
 LDFLAGS_ =
 LDFLAGS_win32 = -mconsole
+#LYRA_STATIC = y/n: link statically (needs static libraries in the sysroot, e.g. libdrm.a for tiny386_drm)
+LYRA_STATIC = n
+LDFLAGS_lyra = -Wl,--gc-sections $(if $(filter y,${LYRA_STATIC}),-static)
 LDFLAGS = ${LDFLAGS_${PLAT}}
 
 LIBS = -lm
@@ -55,11 +76,18 @@ LIBS_RAWDRAW = ${LIBS_RAWDRAW_${PLAT}}
 USE_SDL = n
 
 # tiny386_drm (not built by default): KMS/DRM frontend for the Linux console
-PKG_CONFIG = pkg-config
-CFLAGS_DRM = `${PKG_CONFIG} --cflags libdrm 2>/dev/null || echo -I/usr/include/libdrm`
+# (cross builds do not ask the build machine's pkg-config; set PKG_CONFIG to the sysroot's if it has one)
+PKG_CONFIG_ = pkg-config
+PKG_CONFIG_win32 = pkg-config
+PKG_CONFIG_lyra = false
+PKG_CONFIG = ${PKG_CONFIG_${PLAT}}
+CFLAGS_DRM = `${PKG_CONFIG} --cflags libdrm 2>/dev/null || echo -I${SYSROOT}/usr/include/libdrm`
 LIBS_DRM = `${PKG_CONFIG} --libs libdrm 2>/dev/null || echo -ldrm`
 #DRM_AUDIO = y/n: tiny386_drm sound through rawdraw's CNFA (needs ALSA headers to build; libasound is loaded at run time)
-DRM_AUDIO = $(shell test -e /usr/include/alsa/asoundlib.h && echo y || echo n)
+DRM_AUDIO_ = $(shell test -e /usr/include/alsa/asoundlib.h && echo y || echo n)
+DRM_AUDIO_win32 = n
+DRM_AUDIO_lyra = $(shell test -n "${SYSROOT}" && test -e "${SYSROOT}/usr/include/alsa/asoundlib.h" && echo y || echo n)
+DRM_AUDIO = ${DRM_AUDIO_${PLAT}}
 CFLAGS_DRM_AUDIO_y = -DDRM_AUDIO
 LIBS_DRM_AUDIO_y = -ldl -lpthread
 
@@ -78,8 +106,11 @@ CPUABS_y = kvm.c
 CFLAGS_CPUABS_y = -DUSE_CPUABS
 CFLAGS += ${CFLAGS_CPUABS_${USE_CPUABS}}
 
-#USE_SLIRP = y/n
-USE_SLIRP = y
+#USE_SLIRP = y/n (lyra: n by default, as a musl sysroot seldom has libslirp; TUN/TAP still works)
+USE_SLIRP_ = y
+USE_SLIRP_win32 = y
+USE_SLIRP_lyra = n
+USE_SLIRP = ${USE_SLIRP_${PLAT}}
 CFLAGS_SLIRP_y = -DUSE_SLIRP ${SLIRP_INC}
 LIBS_SLIRP_y_ = ${SLIRP_LIB}
 LIBS_SLIRP_y_win32 = ${SLIRP_LIB} -lws2_32 -liphlpapi
@@ -89,6 +120,7 @@ LIBS += ${LIBS_SLIRP_${USE_SLIRP}_${PLAT}}
 #USE_TUNTAP = y/n
 USE_TUNTAP_ = y
 USE_TUNTAP_win32 = n
+USE_TUNTAP_lyra = y
 USE_TUNTAP = ${USE_TUNTAP_${PLAT}}
 CFLAGS_TUNTAP_y = -DUSE_TUNTAP
 CFLAGS += ${CFLAGS_TUNTAP_${USE_TUNTAP}}
@@ -144,6 +176,8 @@ PREPARE_WAYLAND = ${PREPARE_WAYLAND_${ENABLE_RAWDRAW_WAYLAND}}
 
 PROGS_ = tiny386 tiny386_headless wifikbd initnet
 PROGS_win32 = tiny386 tiny386_headless wifikbd
+# lyra: the console (KMS/DRM) frontend, no SDL or X
+PROGS_lyra = tiny386_drm tiny386_headless
 PROGS = ${PROGS_${PLAT}}
 
 SRCS += ini.c i8259.c i8254.c ide.c vga.c vgafont.c i8042.c misc.c adlib.c ne2000.c i8257.c sb16.c pcspk.c
@@ -181,13 +215,16 @@ clean:
 	rm -f ${OBJS} i386.o fast/fast.o .fast-* amd64.o fpu.o amd64-comb.o i386-comb.o fpu-leg32.o i386-leg32.o .depends ${PROGS} tiny386_drm
 
 show:
+	@echo PLAT = ${PLAT}
 	@echo CC = ${CC}
+	@echo SYSROOT = ${SYSROOT}
 	@echo USE_FAST = ${USE_FAST}
 	@echo USE_FASTMEM = ${USE_FASTMEM}
 	@echo USE_AMD64 = ${USE_AMD64}
 	@echo USE_CPUABS = ${USE_CPUABS}
 	@echo USE_SDL = ${USE_SDL}
 	@echo USE_SLIRP = ${USE_SLIRP}
+	@echo DRM_AUDIO = ${DRM_AUDIO}
 	@echo SLIRP_INC = ${SLIRP_INC}
 	@echo SLIRP_LIB = ${SLIRP_LIB}
 	@echo USE_TUNTAP = ${USE_TUNTAP}

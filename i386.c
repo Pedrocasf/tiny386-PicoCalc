@@ -942,6 +942,9 @@ static inline bool in_iomem(uword addr)
 struct fm_extable_entry {
 	uintptr_t insn, fixup;
 };
+/* the probes' entries; "R" (SHF_GNU_RETAIN) keeps --gc-sections from dropping
+ * the section, which lld (zig cc, clang) does even though __start_/__stop_
+ * refer to it (binutils 2.36+, LLVM 13+) */
 extern struct fm_extable_entry __start_fm_extable[], __stop_fm_extable[];
 
 static struct {
@@ -985,7 +988,7 @@ static inline bool fm_probe(const u8 *p)
 {
 #if defined(__x86_64__)
 	asm goto("1: cmpb $0, (%0)\n\t"
-		 ".pushsection fm_extable, \"aw\"\n\t"
+		 ".pushsection fm_extable, \"awR\"\n\t"
 		 ".balign 8\n\t"
 		 ".quad 1b, %l[fault]\n\t"
 		 ".popsection"
@@ -993,7 +996,7 @@ static inline bool fm_probe(const u8 *p)
 #else
 	/* ARM or Thumb-2; the fixup keeps the mode the probe ran in */
 	asm goto("1: ldrb ip, [%0]\n\t"
-		 ".pushsection fm_extable, \"aw\"\n\t"
+		 ".pushsection fm_extable, \"awR\"\n\t"
 		 ".balign 4\n\t"
 		 ".word 1b, %l[fault]\n\t"
 		 ".popsection"
