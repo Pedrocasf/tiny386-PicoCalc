@@ -42,7 +42,7 @@ CFLAGS_SDL = ${CFLAGS} `${SDL_CONFIG} --cflags`
 
 LDFLAGS_ =
 LDFLAGS_win32 = -mconsole
-#LYRA_STATIC = y/n: link statically (needs static libraries in the sysroot, e.g. libdrm.a for tiny386_drm)
+#LYRA_STATIC = y/n: link statically (needs static libraries in the sysroot)
 LYRA_STATIC = n
 LDFLAGS_lyra = -Wl,--gc-sections $(if $(filter y,${LYRA_STATIC}),-static)
 LDFLAGS = ${LDFLAGS_${PLAT}}
@@ -75,14 +75,9 @@ LIBS_RAWDRAW = ${LIBS_RAWDRAW_${PLAT}}
 #USE_SDL = y/n
 USE_SDL = n
 
-# tiny386_drm (not built by default): KMS/DRM frontend for the Linux console
-# (cross builds do not ask the build machine's pkg-config; set PKG_CONFIG to the sysroot's if it has one)
-PKG_CONFIG_ = pkg-config
-PKG_CONFIG_win32 = pkg-config
-PKG_CONFIG_lyra = false
-PKG_CONFIG = ${PKG_CONFIG_${PLAT}}
-CFLAGS_DRM = `${PKG_CONFIG} --cflags libdrm 2>/dev/null || echo -I${SYSROOT}/usr/include/libdrm`
-LIBS_DRM = `${PKG_CONFIG} --libs libdrm 2>/dev/null || echo -ldrm`
+# tiny386_drm (not built by default): KMS/DRM frontend for the Linux console.
+# It uses the kernel's DRM ioctls directly (drm/kms.h): only the kernel
+# headers (<drm/drm.h>, <drm/drm_mode.h>) are needed, no libdrm.
 #DRM_AUDIO = y/n: tiny386_drm sound through rawdraw's CNFA (needs ALSA headers to build; libasound is loaded at run time)
 DRM_AUDIO_ = $(shell test -e /usr/include/alsa/asoundlib.h && echo y || echo n)
 DRM_AUDIO_win32 = n
@@ -269,7 +264,7 @@ tiny386${SUFF_RAWDRAW}: rawdraw/main.c ${OBJS}
 
 tiny386_drm: drm/main.c ${OBJS}
 	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"
-	${Q}${CC} ${LDFLAGS} ${CFLAGS} ${CFLAGS_DRM} ${CFLAGS_DRM_AUDIO_${DRM_AUDIO}} -o $@ $^$> ${LIBS_DRM} ${LIBS_DRM_AUDIO_${DRM_AUDIO}} ${LIBS}
+	${Q}${CC} ${LDFLAGS} ${CFLAGS} ${CFLAGS_DRM_AUDIO_${DRM_AUDIO}} -o $@ $^$> ${LIBS_DRM_AUDIO_${DRM_AUDIO}} ${LIBS}
 
 tiny386_headless: main.c ${OBJS}
 	@/bin/echo -e " \e[1;32mCCLD\e[0m\t\e[1;32m->\e[0m \e[1;37m$@\e[0m"

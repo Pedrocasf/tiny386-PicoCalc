@@ -2,8 +2,9 @@
  * Linux KMS/DRM frontend: runs full-screen from a text console (VT), with no
  * X11, Wayland or SDL.
  *
- * Display: libdrm, a connected connector in its preferred mode, two dumb
- * buffers flipped with drmModePageFlip (or one buffer and drmModeDirtyFB
+ * Display: KMS through the kernel's DRM ioctls (drm/kms.h, no libdrm), a
+ * connected connector in its preferred mode, two dumb buffers flipped with
+ * page flips (or one buffer and DIRTYFB
  * where page flips are not available), XRGB8888 or, where the display only
  * takes that, RGB565.  What is shown is the guest's picture (the part of
  * the frame buffer vga.c last drew in), centred and scaled as -scale says:
@@ -38,9 +39,7 @@
 #include <linux/input.h>
 #include <linux/kd.h>
 #include <linux/vt.h>
-#include <xf86drm.h>
-#include <xf86drmMode.h>
-#include <drm_fourcc.h>
+#include "kms.h"
 #include "pc.h"
 #include "osd/osd.h"
 
@@ -180,8 +179,9 @@ typedef struct {
 	int drm_fd;
 	uint32_t conn_id, crtc_id;
 	int crtc_index;
-	drmModeModeInfo mode;
-	drmModeCrtc *saved_crtc;
+	struct drm_mode_modeinfo mode;
+	struct drm_mode_crtc saved_crtc;
+	bool have_saved_crtc;
 	int bpp;                /* of the dumb buffers: 32 or 16 */
 	DumbBuf buf[2];
 	int nbufs;
@@ -231,27 +231,27 @@ static bool dumb_create(Console *s, DumbBuf *b)
 	creq.width = s->mode.hdisplay;
 	creq.height = s->mode.vdisplay;
 	creq.bpp = s->bpp;
-	if (drmIoctl(s->drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0)
+	if (kms_ioctl(s->drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0)
 		return false;
 	b->handle = creq.handle;
 	b->pitch = creq.pitch;
 	b->size = creq.size;
-	if (drmModeAddFB(s->drm_fd, creq.width, creq.height,
-			 s->bpp == 16 ? 16 : 24, s->bpp,
-			 b->pitch, b->handle, &b->fb_id)) {
+	if (kms_add_fb(s->drm_fd, creq.width, creq.height,
+		       s->bpp == 16 ? 16 : 24, s->bpp,
+		       b->pitch, b->handle, &b->fb_id)) {
 		struct drm_mode_destroy_dumb dreq = { .handle = b->handle };
-		drmIoctl(s->drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+		kms_ioctl(s->drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
 		return false;
 	}
 	struct drm_mode_map_dumb mreq = { .handle = b->handle };
 	void *map = MAP_FAILED;
-	if (drmIoctl(s->drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) == 0)
+	if (kms_ioctl(s->drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) == 0)
 		map = mmap(NULL, b->size, PROT_READ | PROT_WRITE, MAP_SHARED,
 			   s->drm_fd, mreq.offset);
 	if (map == MAP_FAILED) {
 		struct drm_mode_destroy_dumb dreq = { .handle = b->handle };
-		drmModeRmFB(s->drm_fd, b->fb_id);
-		drmIoctl(s->drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+		kms_rm_fb(s->drm_fd, b->fb_id);
+		kms_ioctl(s->drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
 		return false;
 	}
 	b->map = map;
@@ -264,41 +264,34 @@ static void dumb_destroy(Console *s, DumbBuf *b)
 {
 	struct drm_mode_destroy_dumb dreq = { .handle = b->handle };
 	munmap(b->map, b->size);
-	drmModeRmFB(s->drm_fd, b->fb_id);
-	drmIoctl(s->drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+	kms_rm_fb(s->drm_fd, b->fb_id);
+	kms_ioctl(s->drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
 }
 
-static int crtc_index(drmModeRes *res, uint32_t crtc)
+static int crtc_index(KmsRes *res, uint32_t crtc)
 {
-	for (int j = 0; j < res->count_crtcs; j++)
+	for (uint32_t j = 0; j < res->count_crtcs; j++)
 		if (res->crtcs[j] == crtc)
 			return j;
 	return -1;
 }
 
 /* the CRTC for a connector: the one it drives now, else a free one */
-static uint32_t find_crtc(int fd, drmModeRes *res, drmModeConnector *conn)
+static uint32_t find_crtc(int fd, KmsRes *res, KmsConnector *conn)
 {
 	if (conn->encoder_id) {
-		drmModeEncoder *enc = drmModeGetEncoder(fd, conn->encoder_id);
-		if (enc) {
-			uint32_t crtc = enc->crtc_id;
-			drmModeFreeEncoder(enc);
-			if (crtc)
-				return crtc;
-		}
+		struct drm_mode_get_encoder enc;
+		if (kms_get_encoder(fd, conn->encoder_id, &enc) == 0 &&
+		    enc.crtc_id)
+			return enc.crtc_id;
 	}
-	for (int i = 0; i < conn->count_encoders; i++) {
-		drmModeEncoder *enc = drmModeGetEncoder(fd, conn->encoders[i]);
-		if (!enc)
+	for (uint32_t i = 0; i < conn->count_encoders; i++) {
+		struct drm_mode_get_encoder enc;
+		if (kms_get_encoder(fd, conn->encoders[i], &enc) < 0)
 			continue;
-		for (int j = 0; j < res->count_crtcs; j++) {
-			if (enc->possible_crtcs & (1u << j)) {
-				drmModeFreeEncoder(enc);
+		for (uint32_t j = 0; j < res->count_crtcs; j++)
+			if (enc.possible_crtcs & (1u << j))
 				return res->crtcs[j];
-			}
-		}
-		drmModeFreeEncoder(enc);
 	}
 	return 0;
 }
@@ -314,28 +307,28 @@ static bool drm_try_device(Console *s, const char *path,
 	if (fd < 0)
 		return false;
 	uint64_t cap = 0;
-	drmModeRes *res = NULL;
-	if (drmGetCap(fd, DRM_CAP_DUMB_BUFFER, &cap) < 0 || !cap ||
-	    !(res = drmModeGetResources(fd))) {
+	KmsRes *res = NULL;
+	if (kms_get_cap(fd, DRM_CAP_DUMB_BUFFER, &cap) < 0 || !cap ||
+	    !(res = kms_get_res(fd))) {
 		close(fd);
 		return false;
 	}
 	bool found = false;
-	for (int i = 0; i < res->count_connectors && !found; i++) {
-		drmModeConnector *conn = drmModeGetConnector(fd, res->connectors[i]);
+	for (uint32_t i = 0; i < res->count_connectors && !found; i++) {
+		KmsConnector *conn = kms_get_connector(fd, res->connectors[i]);
 		if (!conn)
 			continue;
-		if (conn->connection == DRM_MODE_CONNECTED &&
+		if (conn->connection == KMS_CONNECTED &&
 		    conn->count_modes > 0) {
-			int m = 0;
-			for (int j = 0; j < conn->count_modes; j++) {
+			uint32_t m = 0;
+			for (uint32_t j = 0; j < conn->count_modes; j++) {
 				if (conn->modes[j].type & DRM_MODE_TYPE_PREFERRED) {
 					m = j;
 					break;
 				}
 			}
 			if (want_w > 0) {
-				int j;
+				uint32_t j;
 				for (j = 0; j < conn->count_modes; j++) {
 					if (conn->modes[j].hdisplay == want_w &&
 					    conn->modes[j].vdisplay == want_h) {
@@ -358,9 +351,9 @@ static bool drm_try_device(Console *s, const char *path,
 				found = true;
 			}
 		}
-		drmModeFreeConnector(conn);
+		kms_free_connector(conn);
 	}
-	drmModeFreeResources(res);
+	kms_free_res(res);
 	if (!found)
 		close(fd);
 	return found;
@@ -373,24 +366,18 @@ static bool drm_try_device(Console *s, const char *path,
 static int drm_pick_bpp(Console *s)
 {
 	bool xrgb = false, rgb565 = false, seen = false;
-	drmSetClientCap(s->drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
-	drmModePlaneRes *pr = drmModeGetPlaneResources(s->drm_fd);
-	for (uint32_t i = 0; pr && i < pr->count_planes; i++) {
-		drmModePlane *p = drmModeGetPlane(s->drm_fd, pr->planes[i]);
+	kms_set_client_cap(s->drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+	uint32_t nplanes;
+	uint32_t *planes = kms_get_planes(s->drm_fd, &nplanes);
+	for (uint32_t i = 0; i < nplanes; i++) {
+		KmsPlane *p = kms_get_plane(s->drm_fd, planes[i]);
 		if (!p)
 			continue;
-		bool primary = false;
-		drmModeObjectProperties *props = drmModeObjectGetProperties(
-			s->drm_fd, p->plane_id, DRM_MODE_OBJECT_PLANE);
-		for (uint32_t j = 0; props && j < props->count_props; j++) {
-			drmModePropertyRes *prop =
-				drmModeGetProperty(s->drm_fd, props->props[j]);
-			if (prop && strcmp(prop->name, "type") == 0 &&
-			    props->prop_values[j] == DRM_PLANE_TYPE_PRIMARY)
-				primary = true;
-			drmModeFreeProperty(prop);
-		}
-		drmModeFreeObjectProperties(props);
+		uint64_t type;
+		bool primary = kms_get_prop(s->drm_fd, p->plane_id,
+					    DRM_MODE_OBJECT_PLANE, "type",
+					    &type) == 0 &&
+			       type == KMS_PLANE_TYPE_PRIMARY;
 		if (primary && s->crtc_index >= 0 &&
 		    (p->possible_crtcs & (1u << s->crtc_index))) {
 			seen = true;
@@ -401,10 +388,10 @@ static int drm_pick_bpp(Console *s)
 					rgb565 = true;
 			}
 		}
-		drmModeFreePlane(p);
+		kms_free_plane(p);
 	}
-	drmModeFreePlaneResources(pr);
-	drmSetClientCap(s->drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 0);
+	free(planes);
+	kms_set_client_cap(s->drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 0);
 	if (seen && !xrgb && rgb565)
 		return 16;
 	return 32;
@@ -427,12 +414,13 @@ static void drm_init(Console *s)
 		die("no DRM device with a connected display "
 		    "(set TINY386_DRM_DEVICE=/dev/dri/cardN?)");
 
-	if (drmSetMaster(s->drm_fd) < 0)
-		fprintf(stderr, "tiny386_drm: drmSetMaster: %s "
+	if (kms_set_master(s->drm_fd) < 0)
+		fprintf(stderr, "tiny386_drm: SET_MASTER: %s "
 			"(is a display server running on this device?)\n",
 			strerror(errno));
 
-	s->saved_crtc = drmModeGetCrtc(s->drm_fd, s->crtc_id);
+	s->have_saved_crtc =
+		kms_get_crtc(s->drm_fd, s->crtc_id, &s->saved_crtc) == 0;
 
 	s->bpp = o->bpp == 16 || o->bpp == 32 ? o->bpp : drm_pick_bpp(s);
 	s->nbufs = 0;
@@ -453,9 +441,9 @@ static void drm_init(Console *s)
 	if (s->nbufs == 0)
 		die("cannot create a dumb buffer");
 	s->front = 0;
-	if (drmModeSetCrtc(s->drm_fd, s->crtc_id, s->buf[0].fb_id, 0, 0,
-			   &s->conn_id, 1, &s->mode)) {
-		fprintf(stderr, "tiny386_drm: drmModeSetCrtc: %s\n",
+	if (kms_set_crtc(s->drm_fd, s->crtc_id, s->buf[0].fb_id, 0, 0,
+			 &s->conn_id, 1, &s->mode)) {
+		fprintf(stderr, "tiny386_drm: SETCRTC: %s\n",
 			strerror(errno));
 		exit(1);
 	}
@@ -661,14 +649,14 @@ static void present(Console *s)
 	if (s->nbufs > 1) {
 		int back = s->front ^ 1;
 		blit(s, &s->buf[back]);
-		if (drmModePageFlip(s->drm_fd, s->crtc_id, s->buf[back].fb_id,
-				    DRM_MODE_PAGE_FLIP_EVENT, s) == 0) {
+		if (kms_page_flip(s->drm_fd, s->crtc_id, s->buf[back].fb_id,
+				  DRM_MODE_PAGE_FLIP_EVENT, s) == 0) {
 			s->front = back;
 			s->flip_pending = true;
 			return;
 		}
 		/* no page flips here: one buffer, set once, from now on */
-		fprintf(stderr, "tiny386_drm: drmModePageFlip: %s, "
+		fprintf(stderr, "tiny386_drm: PAGE_FLIP: %s, "
 			"using a single buffer\n", strerror(errno));
 		dumb_destroy(s, &s->buf[back]);
 		s->nbufs = 1;
@@ -679,12 +667,11 @@ static void present(Console *s)
 	}
 	DumbBuf *b = &s->buf[s->front];
 	blit(s, b);
-	drmModeClip clip = { 0, 0, s->mode.hdisplay, s->mode.vdisplay };
-	drmModeDirtyFB(s->drm_fd, b->fb_id, &clip, 1);
+	struct drm_clip_rect clip = { 0, 0, s->mode.hdisplay, s->mode.vdisplay };
+	kms_dirty_fb(s->drm_fd, b->fb_id, &clip, 1);
 }
 
-static void page_flip_handler(int fd, unsigned int seq, unsigned int sec,
-			      unsigned int usec, void *data)
+static void page_flip_handler(void *data)
 {
 	Console *s = data;
 	s->flip_pending = false;
@@ -695,12 +682,8 @@ static void page_flip_handler(int fd, unsigned int seq, unsigned int sec,
 static void drm_handle_events(Console *s, int timeout)
 {
 	struct pollfd pfd = { s->drm_fd, POLLIN, 0 };
-	drmEventContext ev = {
-		.version = 2,
-		.page_flip_handler = page_flip_handler,
-	};
 	while (poll(&pfd, 1, timeout) > 0 && (pfd.revents & POLLIN)) {
-		drmHandleEvent(s->drm_fd, &ev);
+		kms_handle_events(s->drm_fd, page_flip_handler);
 		timeout = 0;
 	}
 }
@@ -1066,7 +1049,7 @@ static void vt_handle(Console *s)
 			input_ungrab_all(s);
 			drm_handle_events(s, s->flip_pending ? 50 : 0);
 			s->flip_pending = false;
-			drmDropMaster(s->drm_fd);
+			kms_drop_master(s->drm_fd);
 			s->active = false;
 		}
 		ioctl(s->tty_fd, VT_RELDISP, 1);
@@ -1075,12 +1058,12 @@ static void vt_handle(Console *s)
 		g_vt_acquire = 0;
 		ioctl(s->tty_fd, VT_RELDISP, VT_ACKACQ);
 		if (!s->active) {
-			if (drmSetMaster(s->drm_fd) < 0)
-				fprintf(stderr, "tiny386_drm: drmSetMaster: %s\n",
+			if (kms_set_master(s->drm_fd) < 0)
+				fprintf(stderr, "tiny386_drm: SET_MASTER: %s\n",
 					strerror(errno));
-			drmModeSetCrtc(s->drm_fd, s->crtc_id,
-				       s->buf[s->front].fb_id, 0, 0,
-				       &s->conn_id, 1, &s->mode);
+			kms_set_crtc(s->drm_fd, s->crtc_id,
+				     s->buf[s->front].fb_id, 0, 0,
+				     &s->conn_id, 1, &s->mode);
 			s->active = true;
 			present(s);
 		}
@@ -1103,16 +1086,14 @@ static void cleanup(void)
 	s->nin = 0;
 	if (s->active) {
 		drm_handle_events(s, s->flip_pending ? 50 : 0);
-		drmModeCrtc *c = s->saved_crtc;
-		if (c && c->mode_valid)
-			drmModeSetCrtc(s->drm_fd, c->crtc_id, c->buffer_id,
-				       c->x, c->y, &s->conn_id, 1, &c->mode);
+		struct drm_mode_crtc *c = &s->saved_crtc;
+		if (s->have_saved_crtc && c->mode_valid)
+			kms_set_crtc(s->drm_fd, c->crtc_id, c->fb_id,
+				     c->x, c->y, &s->conn_id, 1, &c->mode);
 	}
 	for (int i = 0; i < s->nbufs; i++)
 		dumb_destroy(s, &s->buf[i]);
-	if (s->saved_crtc)
-		drmModeFreeCrtc(s->saved_crtc);
-	drmDropMaster(s->drm_fd);
+	kms_drop_master(s->drm_fd);
 	close(s->drm_fd);
 	if (s->tty_fd >= 0) {
 		struct vt_mode vtm = {0};

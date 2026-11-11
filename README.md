@@ -60,11 +60,11 @@ make PLAT=lyra CROSS_COMPILE=arm-buildroot-linux-musleabihf- SYSROOT=/path/to/sy
 ```
 
 - `CROSS_COMPILE`: the toolchain prefix, default `arm-linux-musleabihf-`. A Buildroot SDK's prefix is usually `arm-buildroot-linux-musleabihf-`.
-- `SYSROOT`: passed as `--sysroot`. `tiny386_drm` needs libdrm in it. ALSA headers there turn on sound (`DRM_AUDIO`). Set `PKG_CONFIG` to the sysroot's pkg-config if it has one; the build machine's is not used.
-- `LYRA_STATIC=y`: link statically, which needs static libraries (e.g. `libdrm.a` for `tiny386_drm`).
+- `SYSROOT`: passed as `--sysroot`. `tiny386_drm` needs only the kernel headers (`drm/drm.h`, `drm/drm_mode.h`) in it, not libdrm. ALSA headers there turn on sound (`DRM_AUDIO`).
+- `LYRA_STATIC=y`: link statically, which needs static libraries (libc's, at least).
 - `USE_SLIRP` is `n` by default here, as a musl sysroot seldom has libslirp (set `USE_SLIRP=y` if yours does). TUN/TAP networking still works.
 - `USE_FAST` and `USE_FASTMEM` stay off by default; use `scripts/lyra-bench.sh` to find what helps on the board.
-- With zig as the compiler, use `CC="zig cc -target arm-linux-musleabihf" LYRA_ARCH="-mcpu=cortex_a7 -mfpu=neon-vfpv4 -mfloat-abi=hard" LYRA_STATIC=y`. zig ships musl, so no sysroot is needed for `tiny386_headless`.
+- With zig as the compiler, use `CC="zig cc -target arm-linux-musleabihf" LYRA_ARCH="-mcpu=cortex_a7 -mfpu=neon-vfpv4 -mfloat-abi=hard" LYRA_STATIC=y`. zig ships musl and the kernel headers, so no sysroot is needed for either program (without one, `tiny386_drm` builds without sound).
 
 To compare the CPU options on the board, build every variant on the build machine (any `make` variables above can follow `build`), copy `build/lyra-bench/` to the board, and run the script there. It prints a table of Mips per `-bench` row. No BIOS is needed.
 
@@ -122,10 +122,9 @@ Press "Ctrl + ]" to grab/ungrab the keyboard and mouse. Press "Ctrl + [" to show
 ### Linux console (KMS/DRM)
 `tiny386_drm` runs full-screen straight from a Linux text console (VT), with no X11, Wayland or SDL. It is not built by default:
 ```sh
-sudo apt install libdrm-dev   # pkg-config is optional
 make tiny386_drm              # sound if the ALSA headers are installed; DRM_AUDIO=n to leave it out
 ```
-It needs only libdrm. With `DRM_AUDIO=y` (the default when `/usr/include/alsa/asoundlib.h` exists) it plays sound through rawdraw's CNFA, which loads `libasound` at run time.
+It talks to the kernel's DRM ioctls directly, so it needs no libraries, only the kernel headers (`linux-libc-dev`). With `DRM_AUDIO=y` (the default when `/usr/include/alsa/asoundlib.h` exists) it plays sound through rawdraw's CNFA, which loads `libasound` at run time.
 
 Run it from a VT (e.g. ctrl + alt + F3, log in), not from a terminal in a desktop session:
 ```sh
