@@ -1977,6 +1977,13 @@ static int bf_write_async(BlockDevice *bs,
     case BF_MODE_RW:
         fseeko(bf->f, bf->start_offset + sector_num * SECTOR_SIZE, SEEK_SET);
         fwrite(buf, 1, n * SECTOR_SIZE, bf->f);
+#ifndef BUILD_ESP32
+        /* hand each write to the OS at once: left in stdio's buffer, the
+           last one (often the partition table, which is all FDISK writes)
+           is lost if the emulator is killed, and the image looks unchanged
+           to anything that reads it meanwhile */
+        fflush(bf->f);
+#endif
         ret = 0;
         break;
     case BF_MODE_SNAPSHOT:

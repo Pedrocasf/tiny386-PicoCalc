@@ -319,6 +319,8 @@ static void set_sig_handler()
 {
 	signal(SIGTERM, sig_handler);
 	signal(SIGINT, sig_handler);
+	/* closing the terminal: stop the same way, so disk images are closed */
+	signal(SIGHUP, sig_handler);
 }
 #else
 #define g_running 1

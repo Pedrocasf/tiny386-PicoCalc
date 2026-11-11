@@ -574,6 +574,9 @@ int emulink_data_write_string(void *s, uint8_t *buf, int size, int count)
 				break;
 			e->dataleft -= len;
 			if (e->dataleft == 0) {
+				/* the whole write is in: hand it to the OS, as
+				   ide.c does for hard disks */
+				fflush(e->fdd[e->args[0]]);
 				e->cmd = -1;
 				e->status = 0;
 				return count;
